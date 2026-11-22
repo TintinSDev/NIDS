@@ -1,0 +1,106 @@
+{
+  "split_version": "3.0",
+  "random_state": 42,
+  "strategy": "Stratified row-level split within each source_file and attack_family group.",
+  "ratios": {
+    "train": 0.7,
+    "calibration": 0.1,
+    "val": 0.1,
+    "test": 0.1
+  },
+  "input_file": "data/interim/cicids2017_clean.parquet",
+  "input_rows": 663855,
+  "source_metadata_columns": [
+    "source_file",
+    "source_row"
+  ],
+  "stratification_columns": [
+    "source_file",
+    "attack_family"
+  ],
+  "target_column": "is_malicious",
+  "feature_count": 54,
+  "integrity_checks": {
+    "duplicate_source_rows": false,
+    "partition_overlap": false,
+    "missing_rows": false,
+    "all_rows_assigned_once": true,
+    "original_columns_preserved": true
+  },
+  "limitations": [
+    "This is a row-level split, not a session-level split.",
+    "Source IPs, source ports and timestamps are unavailable for verifying session independence.",
+    "Rows from the same capture and attack family can occur in different partitions.",
+    "The test partition is held out from training, calibration and validation within this split, but it is not an independent capture-file evaluation."
+  ],
+  "partitions": {
+    "train": {
+      "file": "data/processed/v3/train.parquet",
+      "rows": 464687,
+      "benign_rows": 367394,
+      "malicious_rows": 97293,
+      "attack_families": {
+        "Benign": 367394,
+        "Brute Force": 6354,
+        "DoS/DDoS": 89595,
+        "PortScan": 1344
+      },
+      "source_files": {
+        "Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv": 150942,
+        "Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv": 72838,
+        "Tuesday-WorkingHours.pcap_ISCX.csv": 240907
+      }
+    },
+    "calibration": {
+      "file": "data/processed/v3/calibration.parquet",
+      "rows": 66391,
+      "benign_rows": 52489,
+      "malicious_rows": 13902,
+      "attack_families": {
+        "Benign": 52489,
+        "Brute Force": 909,
+        "DoS/DDoS": 12800,
+        "PortScan": 193
+      },
+      "source_files": {
+        "Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv": 21565,
+        "Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv": 10408,
+        "Tuesday-WorkingHours.pcap_ISCX.csv": 34418
+      }
+    },
+    "val": {
+      "file": "data/processed/v3/val.parquet",
+      "rows": 66390,
+      "benign_rows": 52488,
+      "malicious_rows": 13902,
+      "attack_families": {
+        "Benign": 52488,
+        "Brute Force": 909,
+        "DoS/DDoS": 12800,
+        "PortScan": 193
+      },
+      "source_files": {
+        "Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv": 21565,
+        "Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv": 10407,
+        "Tuesday-WorkingHours.pcap_ISCX.csv": 34418
+      }
+    },
+    "test": {
+      "file": "data/processed/v3/test.parquet",
+      "rows": 66387,
+      "benign_rows": 52486,
+      "malicious_rows": 13901,
+      "attack_families": {
+        "Benign": 52486,
+        "Brute Force": 908,
+        "DoS/DDoS": 12800,
+        "PortScan": 193
+      },
+      "source_files": {
+        "Friday-WorkingHours-Afternoon-DDos.pcap_ISCX.csv": 21564,
+        "Friday-WorkingHours-Afternoon-PortScan.pcap_ISCX.csv": 10407,
+        "Tuesday-WorkingHours.pcap_ISCX.csv": 34416
+      }
+    }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "val_rows": 104205,
+  "val_malicious_count": 1923,
+  "selected_high_conf_threshold": 0.10999999999999999,
+  "calibrated_xgb_val": {
+    "precision": 0.20607175712971482,
+    "recall": 0.11648465938637545,
+    "f1": 0.14883720930232558,
+    "pr_auc": 0.08728983931163554,
+    "fpr": 0.008437457226100389
+  },
+  "calibrated_rf_val_pr_auc": 0.29060803012623976,
+  "isolation_forest_val_pr_auc": 0.025238309380323985,
+  "multiclass_val_known_classes": {
+    "classes": [
+      "Benign",
+      "DoS/DDoS"
+    ],
+    "report": {
+      "Benign": {
+        "precision": 1.0,
+        "recall": 0.9995111554330185,
+        "f1-score": 0.9997555179596507,
+        "support": 102282.0
+      },
+      "DoS/DDoS": {
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1-score": 0.0,
+        "support": 0.0
+      },
+      "accuracy": 0.9995111554330185,
+      "macro avg": {
+        "precision": 0.5,
+        "recall": 0.49975557771650925,
+        "f1-score": 0.49987775897982534,
+        "support": 102282.0
+      },
+      "weighted avg": {
+        "precision": 1.0,
+        "recall": 0.9995111554330185,
+        "f1-score": 0.9997555179596507,
+        "support": 102282.0
+      }
+    }
+  }
+}

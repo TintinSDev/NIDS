@@ -1,0 +1,23 @@
+{
+  "artifact_version": "v3",
+  "random_state": 42,
+  "feature_schema": "src/features/features_v1.json",
+  "feature_count": 52,
+  "threshold_selection": {
+    "dataset": "v3/val.parquet",
+    "target_max_fpr": 0.01,
+    "objective": "maximum recall under validation FPR constraint",
+    "xgb_binary": {
+      "threshold": 0.0007568319560959935,
+      "validation_fpr": 0.009411675049535132
+    },
+    "rf_binary": {
+      "threshold": 0.009017518885035464,
+      "validation_fpr": 0.004039018442310623
+    }
+  },
+  "calibration_dataset": "v3/calibration.parquet",
+  "training_dataset": "v3/train.parquet",
+  "test_dataset": "v3/test.parquet",
+  "test_used_for_threshold_selection": false
+}

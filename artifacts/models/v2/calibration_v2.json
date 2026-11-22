@@ -1,0 +1,13 @@
+{
+  "artifact_version": "v2",
+  "selected_high_conf_threshold": 0.0026938808150589466,
+  "threshold_selection": {
+    "dataset": "val",
+    "target_max_fpr": 0.01,
+    "actual_validation_fpr": 0.009888678931239413,
+    "selection_objective": "maximum recall under FPR constraint"
+  },
+  "calibration_dataset": "calibration",
+  "training_dataset": "train",
+  "test_dataset": "test"
+}

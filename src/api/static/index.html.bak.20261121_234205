@@ -1,0 +1,2941 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SENTINEL — AI Network IDS</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script
+      crossorigin
+      src="https://unpkg.com/react@18/umd/react.production.min.js"
+    ></script>
+    <script
+      crossorigin
+      src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"
+    ></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+      body {
+        background: radial-gradient(
+          circle at 18% 18%,
+          #24194a 0%,
+          #0d1021 42%,
+          #080b16 100%
+        );
+        color: #e2e8f0;
+        font-family:
+          Inter,
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          sans-serif;
+      }
+      .glass-card {
+        background: rgba(17, 22, 43, 0.72);
+        border: 1px solid rgba(129, 140, 248, 0.14);
+        backdrop-filter: blur(14px);
+      }
+      .sidebar-glass {
+        background: linear-gradient(
+          180deg,
+          rgba(35, 24, 74, 0.85) 0%,
+          rgba(13, 17, 36, 0.92) 100%
+        );
+        border-right: 1px solid rgba(129, 140, 248, 0.16);
+      }
+      ::-webkit-scrollbar {
+        width: 6px;
+        height: 6px;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: rgba(148, 163, 184, 0.25);
+        border-radius: 9999px;
+      }
+    </style>
+  </head>
+  <body class="min-h-screen antialiased selection:bg-indigo-500/30">
+    <div id="root"></div>
+
+    <script type="text/babel">
+      const { useState, useEffect, useMemo } = React;
+
+      const PORT_LABELS = {
+        22: "SSH",
+        53: "DNS",
+        80: "HTTP",
+        443: "HTTPS",
+        3389: "RDP",
+        8000: "API",
+        8080: "HTTP-ALT",
+      };
+
+      function formatTime(iso) {
+        if (!iso) return "—";
+        const d = new Date(iso);
+        return d.toLocaleTimeString([], {
+          hour12: false,
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        });
+      }
+
+      function LevelBadge({ level }) {
+        const norm = (level || "benign").toLowerCase();
+        if (norm === "confirmed_malicious" || norm === "malicious") {
+          return (
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-rose-500/15 text-rose-300 border border-rose-500/30">
+              <span className="w-1.5 h-1.5 rounded-full bg-rose-400"></span>{" "}
+              Malicious
+            </span>
+          );
+        }
+        if (norm === "suspicious") {
+          return (
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-amber-500/15 text-amber-300 border border-amber-500/30">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400"></span>{" "}
+              Suspicious
+            </span>
+          );
+        }
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>{" "}
+            Benign
+          </span>
+        );
+      }
+
+      function MiniBars({
+        color = "bg-cyan-400",
+        values = [35, 50, 42, 68, 60, 75, 70, 88, 82, 95, 90, 100],
+      }) {
+        return (
+          <div className="flex items-end gap-1 h-7">
+            {values.map((v, i) => (
+              <div
+                key={i}
+                style={{ height: `${Math.max(18, v)}%` }}
+                className={`w-1 rounded-sm ${color} ${i > 7 ? "opacity-95" : "opacity-55"}`}
+              />
+            ))}
+          </div>
+        );
+      }
+
+      function WaveChart({
+        title,
+        subtitle,
+        data = [],
+        series,
+        windowValue,
+        onWindowChange,
+        chartId,
+        unit = "flows",
+        showWindowControls = true,
+        footerLabel = "Live captured traffic",
+        timeLabelFormat = "time",
+      }) {
+        const width = 1000;
+        const height = 250;
+        const padX = 12;
+        const padY = 18;
+        const chartBottom = 215;
+        const usableHeight = chartBottom - padY;
+
+        const values = series.flatMap((item) =>
+          data.map((point) => Number(point[item.key] || 0)),
+        );
+        const maxValue = Math.max(1, ...values) * 1.12;
+
+        const makePath = (key) => {
+          if (!data.length) return { line: "", area: "" };
+
+          const coords = data.map((point, index) => ({
+            x:
+              padX +
+              (index / Math.max(1, data.length - 1)) * (width - padX * 2),
+            y:
+              chartBottom - (Number(point[key] || 0) / maxValue) * usableHeight,
+          }));
+
+          let line = `M ${coords[0].x} ${coords[0].y}`;
+
+          for (let i = 1; i < coords.length; i++) {
+            const previous = coords[i - 1];
+            const current = coords[i];
+            const middleX = (previous.x + current.x) / 2;
+
+            line += ` Q ${middleX} ${previous.y} ${middleX} ${(previous.y + current.y) / 2}`;
+          }
+
+          const last = coords[coords.length - 1];
+          line += ` T ${last.x} ${last.y}`;
+
+          return {
+            line,
+            area: `${line} L ${width - padX} ${chartBottom} L ${padX} ${chartBottom} Z`,
+          };
+        };
+
+        const formatValue = (value) => {
+          if (unit === "bytes") {
+            if (value >= 1024 * 1024)
+              return `${(value / 1048576).toFixed(2)} MB/s`;
+            if (value >= 1024) return `${(value / 1024).toFixed(1)} KB/s`;
+            return `${value.toFixed(0)} B/s`;
+          }
+          if (unit === "alerts")
+            return `${Math.round(value).toLocaleString()} alerts`;
+          return `${Math.round(value).toLocaleString()} flows`;
+        };
+
+        const timeLabels = data.length
+          ? [0, 0.25, 0.5, 0.75, 1].map((fraction) => {
+              const point = data[Math.round((data.length - 1) * fraction)];
+              if (!point?.timestamp) return "";
+              const date = new Date(point.timestamp);
+              return timeLabelFormat === "date"
+                ? date.toLocaleDateString([], {
+                    day: "2-digit",
+                    month: "short",
+                  })
+                : date.toLocaleTimeString([], {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  });
+            })
+          : [];
+
+        return (
+          <section className="glass-card rounded-2xl p-5">
+            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 mb-5">
+              <div>
+                <h2 className="text-sm font-semibold text-white">{title}</h2>
+                <p className="text-xs text-slate-400 mt-1">{subtitle}</p>
+              </div>
+
+              {showWindowControls && (
+                <div className="flex items-center gap-1.5">
+                  {["1m", "15m", "1h", "24h"].map((value) => (
+                    <button
+                      key={value}
+                      onClick={() => onWindowChange(value)}
+                      className={`px-3 py-1.5 rounded-lg text-xs transition ${
+                        windowValue === value
+                          ? "bg-cyan-400/15 text-cyan-300 border border-cyan-400/30"
+                          : "text-slate-400 hover:text-white border border-white/5 hover:bg-white/5"
+                      }`}
+                    >
+                      {value}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-x-5 gap-y-2 mb-3">
+              {series.map((item) => (
+                <div
+                  key={item.key}
+                  className="flex items-center gap-2 text-xs text-slate-300"
+                >
+                  <span
+                    className="w-2 h-2 rounded-full"
+                    style={{
+                      background: item.color,
+                      boxShadow: `0 0 10px ${item.color}`,
+                    }}
+                  />
+                  {item.label}
+                </div>
+              ))}
+            </div>
+
+            <div className="w-full overflow-hidden">
+              <svg
+                viewBox={`0 0 ${width} 250`}
+                preserveAspectRatio="none"
+                className="w-full h-52 md:h-64"
+                role="img"
+                aria-label={title}
+              >
+                <defs>
+                  {series.map((item) => (
+                    <linearGradient
+                      key={item.key}
+                      id={`${chartId}-${item.key}`}
+                      x1="0"
+                      y1="0"
+                      x2="0"
+                      y2="1"
+                    >
+                      <stop
+                        offset="0%"
+                        stopColor={item.color}
+                        stopOpacity="0.28"
+                      />
+                      <stop
+                        offset="100%"
+                        stopColor={item.color}
+                        stopOpacity="0.005"
+                      />
+                    </linearGradient>
+                  ))}
+                </defs>
+
+                {[0, 1, 2, 3, 4].map((line) => {
+                  const y = padY + (usableHeight / 4) * line;
+                  return (
+                    <line
+                      key={line}
+                      x1={padX}
+                      x2={width - padX}
+                      y1={y}
+                      y2={y}
+                      stroke="rgba(148,163,184,0.13)"
+                      strokeDasharray="4 7"
+                    />
+                  );
+                })}
+
+                {series.map((item) => {
+                  const paths = makePath(item.key);
+                  return (
+                    <g key={item.key}>
+                      <path
+                        d={paths.area}
+                        fill={`url(#${chartId}-${item.key})`}
+                      />
+                      <path
+                        d={paths.line}
+                        fill="none"
+                        stroke={item.color}
+                        strokeWidth="3"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        style={{
+                          filter: `drop-shadow(0 0 6px ${item.color}80)`,
+                          transition: "d 700ms ease",
+                        }}
+                      />
+                    </g>
+                  );
+                })}
+
+                {!data.length && (
+                  <text
+                    x="500"
+                    y="120"
+                    textAnchor="middle"
+                    fill="#94a3b8"
+                    fontSize="15"
+                  >
+                    Waiting for live telemetry...
+                  </text>
+                )}
+
+                {timeLabels.map((label, index) => (
+                  <text
+                    key={`${label}-${index}`}
+                    x={padX + (index / 4) * (width - padX * 2)}
+                    y="242"
+                    textAnchor={
+                      index === 0 ? "start" : index === 4 ? "end" : "middle"
+                    }
+                    fill="#64748b"
+                    fontSize="12"
+                  >
+                    {label}
+                  </text>
+                ))}
+              </svg>
+            </div>
+
+            <div className="flex items-center justify-between mt-2 text-xs text-slate-500">
+              <span>{footerLabel}</span>
+              <span>{data.length} time buckets</span>
+            </div>
+          </section>
+        );
+      }
+
+      function App() {
+        const [tab, setTab] = useState("overview");
+        const [search, setSearch] = useState("");
+        const [stats, setStats] = useState({
+          total_flows: 0,
+          flows_by_source: {},
+          total_alerts: 0,
+          alerts_by_level: {},
+          alerts_by_class: {},
+        });
+        const [alerts, setAlerts] = useState([]);
+        const [selectedAlertId, setSelectedAlertId] = useState(null);
+        const [alertDetail, setAlertDetail] = useState(null);
+        const [flows, setFlows] = useState([]);
+        const [traffic, setTraffic] = useState({
+          total_sampled: 0,
+          protocols: {},
+          top_talkers: [],
+          top_ports: [],
+        });
+        const [modelInfo, setModelInfo] = useState({
+          active_version: "v1.0.0",
+          schema_name: "features_v1.json",
+          feature_count: 52,
+          detectors: [],
+          features: [],
+        });
+        const [captureStatus, setCaptureStatus] = useState({
+          interface: "wlo1",
+          bpf_filter: "",
+          worker_active: true,
+          live_flows_total: 0,
+        });
+        const [levelFilter, setLevelFilter] = useState("all");
+        const [statusFilter, setStatusFilter] = useState("all");
+        const [latencyMs, setLatencyMs] = useState(12);
+        const [uploadStatus, setUploadStatus] = useState("");
+        const [reportRange, setReportRange] = useState("7");
+        const [includeEvidence, setIncludeEvidence] = useState(true);
+        const [includeTriage, setIncludeTriage] = useState(true);
+        const [includeModelMetrics, setIncludeModelMetrics] = useState(false);
+        const [reportHistory, setReportHistory] = useState([]);
+
+        const [trafficWindow, setTrafficWindow] = useState("15m");
+        const [trafficSeries, setTrafficSeries] = useState([]);
+        const [driftData, setDriftData] = useState(null);
+        const [driftError, setDriftError] = useState("");
+        const [captureSeries, setCaptureSeries] = useState([]);
+
+        useEffect(() => {
+          if (!captureStatus || !captureStatus.updated_at) return;
+          const sample = {
+            timestamp: new Date(captureStatus.updated_at * 1000).toISOString(),
+            flow_rate: Number(captureStatus.flows_per_sec || 0),
+            queue_depth: Number(captureStatus.pending_flows || 0),
+          };
+          setCaptureSeries((previous) => {
+            const last = previous[previous.length - 1];
+            if (last && last.timestamp === sample.timestamp) return previous;
+            return [...previous, sample].slice(-60);
+          });
+        }, [captureStatus]);
+
+        const fetchDashboardData = async () => {
+          const t0 = performance.now();
+          try {
+            const [sRes, aRes, fRes, tRes, mRes, cRes] = await Promise.all([
+              fetch("/stats"),
+              fetch("/alerts?limit=100"),
+              fetch("/flows?limit=50"),
+              fetch("/traffic/summary?limit_flows=500"),
+              fetch("/models/info"),
+              fetch("/capture/status"),
+            ]);
+            if (sRes.ok) setStats(await sRes.json());
+            if (aRes.ok) {
+              const aData = await aRes.json();
+              const list = aData.alerts || [];
+              setAlerts(list);
+              if (!selectedAlertId && list.length > 0) {
+                setSelectedAlertId(list[0].id);
+              }
+            }
+            if (fRes.ok) {
+              const fData = await fRes.json();
+              setFlows(fData.flows || []);
+            }
+            if (tRes.ok) setTraffic(await tRes.json());
+            if (mRes.ok) setModelInfo(await mRes.json());
+            if (cRes && cRes.ok) setCaptureStatus(await cRes.json());
+            setLatencyMs(Math.max(1, Math.round(performance.now() - t0)));
+          } catch (err) {
+            console.error("Dashboard poll error:", err);
+          }
+        };
+
+        useEffect(() => {
+          fetchDashboardData();
+          const timer = setInterval(fetchDashboardData, 4000);
+          return () => clearInterval(timer);
+        }, []);
+
+        useEffect(() => {
+          let cancelled = false;
+
+          const fetchTrafficSeries = async () => {
+            try {
+              const response = await fetch(
+                `/traffic/timeseries?window=${encodeURIComponent(trafficWindow)}`,
+              );
+              if (!response.ok) return;
+
+              const result = await response.json();
+              if (!cancelled) setTrafficSeries(result.points || []);
+            } catch (error) {
+              console.error("Traffic timeseries error:", error);
+            }
+          };
+
+          fetchTrafficSeries();
+          const timer = setInterval(fetchTrafficSeries, 4000);
+
+          return () => {
+            cancelled = true;
+            clearInterval(timer);
+          };
+        }, [trafficWindow]);
+
+        useEffect(() => {
+          let cancelled = false;
+
+          const fetchDrift = async () => {
+            try {
+              const response = await fetch("/models/drift");
+              if (!response.ok) {
+                throw new Error(`Drift API returned ${response.status}`);
+              }
+
+              const result = await response.json();
+
+              if (!cancelled) {
+                setDriftData(result);
+                setDriftError("");
+              }
+            } catch (error) {
+              if (!cancelled) {
+                setDriftError(
+                  error instanceof Error
+                    ? error.message
+                    : "Could not load feature drift data.",
+                );
+              }
+            }
+          };
+
+          fetchDrift();
+          const interval = setInterval(fetchDrift, 5000);
+
+          return () => {
+            cancelled = true;
+            clearInterval(interval);
+          };
+        }, []);
+
+        useEffect(() => {
+          if (!selectedAlertId) return;
+          fetch(`/alerts/${selectedAlertId}`)
+            .then((r) => (r.ok ? r.json() : null))
+            .then((d) => setAlertDetail(d))
+            .catch(() => {});
+        }, [selectedAlertId, alerts]);
+
+        const handleUpdateStatus = async (alertId, nextStatus) => {
+          const res = await fetch(
+            `/alerts/${alertId}/status?status=${encodeURIComponent(nextStatus)}`,
+            {
+              method: "PATCH",
+            },
+          );
+          if (res.ok) {
+            await fetchDashboardData();
+          }
+        };
+
+        const handleCsvUpload = async (e) => {
+          const file = e.target.files?.[0];
+          if (!file) return;
+          setUploadStatus("Analyzing flow CSV...");
+          const form = new FormData();
+          form.append("file", file);
+          try {
+            const res = await fetch("/analyze/upload?persist=true", {
+              method: "POST",
+              body: form,
+            });
+            const data = await res.json();
+            if (res.ok) {
+              setUploadStatus(
+                `Analyzed ${data.flows_analyzed} flows • Alerts created: ${data.persistence?.alerts_created ?? 0}`,
+              );
+              fetchDashboardData();
+            } else {
+              setUploadStatus(`Error: ${data.detail || "Upload failed"}`);
+            }
+          } catch (err) {
+            setUploadStatus(`Upload error: ${err.message}`);
+          }
+        };
+
+        const filteredAlerts = useMemo(() => {
+          return alerts.filter((a) => {
+            if (levelFilter !== "all" && a.level !== levelFilter) return false;
+            if (statusFilter !== "all" && a.status !== statusFilter)
+              return false;
+            if (search.trim()) {
+              const q = search.toLowerCase();
+              const matchId =
+                `a-${a.id}`.includes(q) || String(a.id).includes(q);
+              const matchClass = (a.attack_class || "")
+                .toLowerCase()
+                .includes(q);
+              if (!matchId && !matchClass) return false;
+            }
+            return true;
+          });
+        }, [alerts, levelFilter, statusFilter, search]);
+
+        const maliciousCount = stats.alerts_by_level?.confirmed_malicious || 0;
+        const suspiciousCount = stats.alerts_by_level?.suspicious || 0;
+        const openAlertsCount = alerts.filter(
+          (a) => a.status === "open",
+        ).length;
+        const liveFlowsCount = stats.flows_by_source?.live || 0;
+        const offlineFlowsCount = stats.flows_by_source?.offline || 0;
+
+        const parsedEvidence = useMemo(() => {
+          if (!alertDetail?.evidence?.length) return { shap: [], scores: {} };
+          const ev = alertDetail.evidence[0];
+          let shap = ev.shap_values || [];
+          let scores = ev.detector_scores || {};
+          if (typeof shap === "string") {
+            try {
+              shap = JSON.parse(shap);
+            } catch {
+              shap = [];
+            }
+          }
+          if (typeof scores === "string") {
+            try {
+              scores = JSON.parse(scores);
+            } catch {
+              scores = {};
+            }
+          }
+          return { shap, scores };
+        }, [alertDetail]);
+
+        const navItems = [
+          { id: "overview", label: "Overview" },
+          { id: "alerts", label: "Alerts", badge: openAlertsCount },
+          { id: "traffic", label: "Traffic" },
+          { id: "models", label: "Models" },
+          { id: "capture", label: "Capture" },
+          { id: "reports", label: "Reports" },
+        ];
+
+        return (
+          <div className="flex min-h-screen">
+            {/* Left Navigation Sidebar */}
+            <aside className="w-64 shrink-0 sidebar-glass flex flex-col justify-between p-5">
+              <div>
+                <div className="flex items-center gap-3 mb-8 px-1">
+                  <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-cyan-400 to-indigo-500 flex items-center justify-center shadow-lg shadow-cyan-500/20">
+                    <div className="w-4 h-4 rounded-full border-2 border-white"></div>
+                  </div>
+                  <div>
+                    <div className="text-sm font-bold tracking-wider text-white">
+                      SENTINEL
+                    </div>
+                    <div className="text-[11px] text-indigo-300/75">
+                      AI Network IDS
+                    </div>
+                  </div>
+                </div>
+
+                <nav className="space-y-1.5">
+                  {navItems.map((item) => {
+                    const active = tab === item.id;
+                    return (
+                      <button
+                        key={item.id}
+                        onClick={() => setTab(item.id)}
+                        className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-sm font-medium transition ${
+                          active
+                            ? "bg-indigo-500/25 text-white border border-indigo-400/30 shadow-inner"
+                            : "text-slate-300/80 hover:bg-white/5 hover:text-white"
+                        }`}
+                      >
+                        <span>{item.label}</span>
+                        {item.badge > 0 && (
+                          <span className="px-2 py-0.5 text-[11px] font-semibold rounded-full bg-rose-500 text-white">
+                            {item.badge}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </nav>
+              </div>
+
+              {/* Bottom Live Capture Status Card */}
+              <div className="glass-card rounded-xl p-3.5 text-xs">
+                <div className="flex items-center gap-2 font-semibold text-white mb-1">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                  <span>Live capture</span>
+                </div>
+                <div className="text-slate-400 mb-2">
+                  {captureStatus.interface} •{" "}
+                  {captureStatus.worker_active ? "Worker active" : "Standby"}
+                </div>
+                <div className="flex justify-between text-slate-300 py-0.5">
+                  <span className="text-slate-400">Live flows</span>
+                  <span className="font-mono font-semibold text-cyan-300">
+                    {liveFlowsCount}
+                  </span>
+                </div>
+                <div className="flex justify-between text-slate-300 py-0.5">
+                  <span className="text-slate-400">Offline flows</span>
+                  <span className="font-mono text-slate-200">
+                    {offlineFlowsCount}
+                  </span>
+                </div>
+              </div>
+            </aside>
+
+            {/* Main Content Area */}
+            <main className="flex-1 p-7 overflow-y-auto">
+              {/* Top Bar */}
+              <header className="flex flex-wrap items-center justify-between gap-4 mb-6">
+                <div>
+                  <h1 className="text-2xl font-bold text-white capitalize">
+                    {tab}
+                  </h1>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    {tab === "overview" &&
+                      "Real-time threat detection • live & batch telemetry"}
+                    {tab === "alerts" &&
+                      "Triage detections with evidence and SHAP explanations"}
+                    {tab === "traffic" &&
+                      "Protocols, top talkers and destination ports"}
+                    {tab === "models" &&
+                      "Calibrated detector ensemble, schema & version metadata"}
+                    {tab === "capture" &&
+                      "Live worker status & batch CSV flow ingestion"}
+                    {tab === "reports" &&
+                      "Generate, review and export threat detection reports"}
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-3">
+                  <input
+                    type="text"
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder="Search IP, class, alert ID..."
+                    className="w-64 px-3.5 py-2 rounded-xl text-xs bg-slate-900/80 border border-indigo-400/20 text-slate-200 placeholder-slate-500 focus:outline-none focus:border-cyan-400/50"
+                  />
+                  <div className="flex items-center gap-2 px-3 py-2 rounded-xl text-xs bg-emerald-500/10 border border-emerald-500/25 text-emerald-300">
+                    <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
+                    <span>Live • {latencyMs}ms API</span>
+                  </div>
+                  <div className="w-10 h-8 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-400 flex items-center justify-center text-xs font-bold text-white">
+                    NIDS
+                  </div>
+                </div>
+              </header>
+
+              {/* OVERVIEW TAB */}
+              {tab === "overview" && (
+                <div className="space-y-6">
+                  {/* 4 KPI Cards */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+                    <div className="glass-card rounded-2xl p-5">
+                      <div className="flex items-center gap-2 text-xs text-slate-300 mb-2">
+                        <span className="w-2 h-2 rounded-full bg-cyan-400"></span>{" "}
+                        Flows analysed
+                      </div>
+                      <div className="flex items-end justify-between">
+                        <div>
+                          <div className="text-3xl font-bold text-white">
+                            {stats.total_flows.toLocaleString()}
+                          </div>
+                          <div className="text-xs text-cyan-400 mt-1">
+                            Live: {liveFlowsCount} • Offline:{" "}
+                            {offlineFlowsCount}
+                          </div>
+                        </div>
+                        <MiniBars color="bg-cyan-400" />
+                      </div>
+                    </div>
+
+                    <div className="glass-card rounded-2xl p-5 border-rose-500/25 bg-rose-950/15">
+                      <div className="flex items-center gap-2 text-xs text-rose-200 mb-2">
+                        <span className="w-2 h-2 rounded-full bg-rose-400"></span>{" "}
+                        Confirmed malicious
+                      </div>
+                      <div className="flex items-end justify-between">
+                        <div>
+                          <div className="text-3xl font-bold text-white">
+                            {maliciousCount.toLocaleString()}
+                          </div>
+                          <div className="text-xs text-rose-300 mt-1">
+                            High-confidence threats
+                          </div>
+                        </div>
+                        <MiniBars
+                          color="bg-rose-400"
+                          values={[
+                            10, 15, 12, 20, 45, 80, 65, 90, 50, 75, 60, 85,
+                          ]}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="glass-card rounded-2xl p-5">
+                      <div className="flex items-center gap-2 text-xs text-amber-200 mb-2">
+                        <span className="w-2 h-2 rounded-full bg-amber-400"></span>{" "}
+                        Suspicious
+                      </div>
+                      <div className="flex items-end justify-between">
+                        <div>
+                          <div className="text-3xl font-bold text-white">
+                            {suspiciousCount.toLocaleString()}
+                          </div>
+                          <div className="text-xs text-amber-300 mt-1">
+                            Queued for analyst review
+                          </div>
+                        </div>
+                        <MiniBars
+                          color="bg-amber-400"
+                          values={[
+                            40, 55, 60, 50, 72, 68, 64, 70, 58, 62, 55, 60,
+                          ]}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="glass-card rounded-2xl p-5">
+                      <div className="flex items-center gap-2 text-xs text-emerald-200 mb-2">
+                        <span className="w-2 h-2 rounded-full bg-emerald-400"></span>{" "}
+                        Open alerts
+                      </div>
+                      <div className="flex items-end justify-between">
+                        <div>
+                          <div className="text-3xl font-bold text-white">
+                            {openAlertsCount}
+                          </div>
+                          <div className="text-xs text-emerald-400 mt-1">
+                            Model {modelInfo.active_version}
+                          </div>
+                        </div>
+                        <MiniBars
+                          color="bg-emerald-400"
+                          values={[
+                            70, 65, 60, 55, 50, 48, 45, 42, 38, 35, 32, 30,
+                          ]}
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <WaveChart
+                    title="Network threat activity"
+                    subtitle="Live flow classification over time"
+                    data={trafficSeries}
+                    windowValue={trafficWindow}
+                    onWindowChange={setTrafficWindow}
+                    chartId="overview-threat"
+                    series={[
+                      { key: "benign", label: "Benign", color: "#22d3ee" },
+                      {
+                        key: "suspicious",
+                        label: "Suspicious",
+                        color: "#fbbf24",
+                      },
+                      {
+                        key: "malicious",
+                        label: "Confirmed malicious",
+                        color: "#fb7185",
+                      },
+                    ]}
+                  />
+
+                  {/* Middle Row: Traffic Pulse + Alert Levels */}
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                    <div className="glass-card rounded-2xl p-5 lg:col-span-2">
+                      <div className="flex items-center justify-between mb-4">
+                        <div>
+                          <h2 className="text-sm font-semibold text-white">
+                            Recent captured flows
+                          </h2>
+                          <p className="text-xs text-slate-400">
+                            Latest 5-tuple network sessions ingested into
+                            PostgreSQL
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => setTab("traffic")}
+                          className="text-xs text-cyan-400 hover:underline"
+                        >
+                          Traffic details →
+                        </button>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left text-xs">
+                          <thead>
+                            <tr className="text-slate-400 border-b border-white/10">
+                              <th className="pb-2">ID</th>
+                              <th className="pb-2">SOURCE → DESTINATION</th>
+                              <th className="pb-2">PROTO</th>
+                              <th className="pb-2">INGEST</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-white/5">
+                            {flows.slice(0, 6).map((f) => (
+                              <tr key={f.id} className="hover:bg-white/5">
+                                <td className="py-2 font-mono text-slate-400">
+                                  #{f.id}
+                                </td>
+                                <td className="py-2 font-mono text-slate-200">
+                                  {f.src_ip}:{f.src_port} → {f.dst_ip}:
+                                  {f.dst_port}
+                                </td>
+                                <td className="py-2 text-cyan-300">
+                                  {f.proto}
+                                </td>
+                                <td className="py-2">
+                                  <span
+                                    className={`px-2 py-0.5 rounded text-[11px] ${f.source === "live" ? "bg-cyan-500/15 text-cyan-300" : "bg-slate-700/60 text-slate-300"}`}
+                                  >
+                                    {f.source}
+                                  </span>
+                                </td>
+                              </tr>
+                            ))}
+                            {flows.length === 0 && (
+                              <tr>
+                                <td
+                                  colSpan="4"
+                                  className="py-6 text-center text-slate-500"
+                                >
+                                  No flows recorded yet.
+                                </td>
+                              </tr>
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    <div className="glass-card rounded-2xl p-5 flex flex-col justify-between">
+                      <div>
+                        <h2 className="text-sm font-semibold text-white">
+                          Alert distribution
+                        </h2>
+                        <p className="text-xs text-slate-400 mb-4">
+                          Breakdown across detection tiers
+                        </p>
+                      </div>
+                      <div className="my-auto flex flex-col items-center justify-center py-4">
+                        <div className="w-32 h-32 rounded-full border-[10px] border-amber-400/80 flex flex-col items-center justify-center shadow-lg shadow-amber-500/10">
+                          <div className="text-2xl font-bold text-white">
+                            {stats.total_alerts}
+                          </div>
+                          <div className="text-[11px] text-slate-400">
+                            alerts
+                          </div>
+                        </div>
+                      </div>
+                      <div className="space-y-2 text-xs mt-4">
+                        <div className="flex justify-between">
+                          <span className="text-slate-300 flex items-center gap-2">
+                            <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
+                            Benign flows
+                          </span>
+                          <span className="font-mono text-emerald-300">
+                            {Math.max(
+                              0,
+                              stats.total_flows - stats.total_alerts,
+                            )}
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate-300 flex items-center gap-2">
+                            <span className="w-2 h-2 rounded-full bg-amber-400"></span>
+                            Suspicious
+                          </span>
+                          <span className="font-mono text-amber-300">
+                            {suspiciousCount}
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate-300 flex items-center gap-2">
+                            <span className="w-2 h-2 rounded-full bg-rose-400"></span>
+                            Confirmed malicious
+                          </span>
+                          <span className="font-mono text-rose-300">
+                            {maliciousCount}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Bottom Row: Recent Alerts + Attack Families */}
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                    <div className="glass-card rounded-2xl p-5 lg:col-span-2">
+                      <div className="flex items-center justify-between mb-4">
+                        <h2 className="text-sm font-semibold text-white">
+                          Recent alerts
+                        </h2>
+                        <button
+                          onClick={() => setTab("alerts")}
+                          className="text-xs text-cyan-400 hover:underline"
+                        >
+                          View all →
+                        </button>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left text-xs">
+                          <thead>
+                            <tr className="text-slate-400 border-b border-white/10">
+                              <th className="pb-2">TIME</th>
+                              <th className="pb-2">ALERT</th>
+                              <th className="pb-2">CLASS</th>
+                              <th className="pb-2">LEVEL</th>
+                              <th className="pb-2">CONF.</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-white/5">
+                            {alerts.slice(0, 5).map((a) => (
+                              <tr
+                                key={a.id}
+                                onClick={() => {
+                                  setSelectedAlertId(a.id);
+                                  setTab("alerts");
+                                }}
+                                className="hover:bg-white/5 cursor-pointer"
+                              >
+                                <td className="py-2.5 font-mono text-slate-400">
+                                  {formatTime(a.created_at)}
+                                </td>
+                                <td className="py-2.5 font-mono text-slate-200">
+                                  A-{a.id} (Flow #{a.flow_id})
+                                </td>
+                                <td className="py-2.5 text-slate-200">
+                                  {a.attack_class}
+                                </td>
+                                <td className="py-2.5">
+                                  <LevelBadge level={a.level} />
+                                </td>
+                                <td className="py-2.5 font-mono text-rose-300">
+                                  {Number(a.confidence).toFixed(2)}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    <div className="glass-card rounded-2xl p-5">
+                      <h2 className="text-sm font-semibold text-white mb-1">
+                        Attack families
+                      </h2>
+                      <p className="text-xs text-slate-400 mb-4">
+                        Confirmed + suspicious breakdown
+                      </p>
+                      <div className="space-y-3.5 text-xs">
+                        {Object.entries(stats.alerts_by_class || {}).map(
+                          ([cls, count]) => {
+                            const pct =
+                              stats.total_alerts > 0
+                                ? Math.round((count / stats.total_alerts) * 100)
+                                : 0;
+                            return (
+                              <div key={cls}>
+                                <div className="flex justify-between mb-1">
+                                  <span className="text-slate-200">{cls}</span>
+                                  <span className="font-mono text-slate-400">
+                                    {count} ({pct}%)
+                                  </span>
+                                </div>
+                                <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                                  <div
+                                    className="h-full bg-gradient-to-r from-rose-500 to-amber-400"
+                                    style={{ width: `${pct}%` }}
+                                  />
+                                </div>
+                              </div>
+                            );
+                          },
+                        )}
+                        {Object.keys(stats.alerts_by_class || {}).length ===
+                          0 && (
+                          <div className="text-slate-500 py-4">
+                            No attack classes recorded yet.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* ALERTS TRIAGE TAB */}
+              {tab === "alerts" && (
+                <div className="space-y-5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {[
+                      { id: "all", label: `All (${alerts.length})` },
+                      {
+                        id: "confirmed_malicious",
+                        label: `Malicious (${maliciousCount})`,
+                      },
+                      {
+                        id: "suspicious",
+                        label: `Suspicious (${suspiciousCount})`,
+                      },
+                    ].map((pill) => (
+                      <button
+                        key={pill.id}
+                        onClick={() => setLevelFilter(pill.id)}
+                        className={`px-3.5 py-1.5 rounded-xl text-xs font-medium border transition ${
+                          levelFilter === pill.id
+                            ? "bg-indigo-500/25 border-indigo-400/40 text-white"
+                            : "bg-slate-900/60 border-white/10 text-slate-400 hover:text-white"
+                        }`}
+                      >
+                        {pill.label}
+                      </button>
+                    ))}
+
+                    <select
+                      value={statusFilter}
+                      onChange={(e) => setStatusFilter(e.target.value)}
+                      className="ml-auto px-3 py-1.5 rounded-xl text-xs bg-slate-900/80 border border-white/10 text-slate-200"
+                    >
+                      <option value="all">Status: All</option>
+                      <option value="open">Status: Open</option>
+                      <option value="acknowledged">Status: Acknowledged</option>
+                      <option value="resolved">Status: Resolved</option>
+                      <option value="false_positive">
+                        Status: False Positive
+                      </option>
+                    </select>
+                  </div>
+
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
+                    {/* Alert List */}
+                    <div className="glass-card rounded-2xl p-5 lg:col-span-2">
+                      <div className="mb-3">
+                        <h2 className="text-sm font-semibold text-white">
+                          All alerts
+                        </h2>
+                        <p className="text-xs text-slate-400">
+                          {filteredAlerts.length} matching results
+                        </p>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left text-xs">
+                          <thead>
+                            <tr className="text-slate-400 border-b border-white/10">
+                              <th className="pb-2">TIME</th>
+                              <th className="pb-2">ALERT / FLOW</th>
+                              <th className="pb-2">CLASS</th>
+                              <th className="pb-2">LEVEL</th>
+                              <th className="pb-2">CONF.</th>
+                              <th className="pb-2">STATUS</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-white/5">
+                            {filteredAlerts.map((a) => {
+                              const selected = a.id === selectedAlertId;
+                              return (
+                                <tr
+                                  key={a.id}
+                                  onClick={() => setSelectedAlertId(a.id)}
+                                  className={`cursor-pointer transition ${
+                                    selected
+                                      ? "bg-cyan-500/15"
+                                      : "hover:bg-white/5"
+                                  }`}
+                                >
+                                  <td className="py-3 font-mono text-slate-400">
+                                    {formatTime(a.created_at)}
+                                  </td>
+                                  <td className="py-3 font-mono text-slate-200">
+                                    A-{a.id} • Flow #{a.flow_id}
+                                  </td>
+                                  <td className="py-3 text-slate-200">
+                                    {a.attack_class}
+                                  </td>
+                                  <td className="py-3">
+                                    <LevelBadge level={a.level} />
+                                  </td>
+                                  <td className="py-3 font-mono text-amber-300">
+                                    {Number(a.confidence).toFixed(2)}
+                                  </td>
+                                  <td className="py-3 capitalize text-slate-300">
+                                    {a.status}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    {/* Right Inspector Panel (SHAP + Triage) */}
+                    <div className="glass-card rounded-2xl p-5">
+                      {alertDetail ? (
+                        <div className="space-y-4">
+                          <div className="flex items-start justify-between">
+                            <div>
+                              <h3 className="text-lg font-bold text-white">
+                                Alert A-{alertDetail.id}
+                              </h3>
+                              <p className="text-xs text-slate-400">
+                                {alertDetail.created_at}
+                              </p>
+                            </div>
+                            <LevelBadge level={alertDetail.level} />
+                          </div>
+
+                          <div>
+                            <div className="flex justify-between items-end mb-1">
+                              <span className="text-xs text-slate-400">
+                                Calibrated confidence
+                              </span>
+                              <span className="text-xl font-bold text-white">
+                                {Number(alertDetail.confidence).toFixed(2)}
+                              </span>
+                            </div>
+                            <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                              <div
+                                className="h-full bg-gradient-to-r from-cyan-400 via-amber-400 to-rose-500"
+                                style={{
+                                  width: `${Math.min(100, Math.round(Number(alertDetail.confidence) * 100))}%`,
+                                }}
+                              />
+                            </div>
+                          </div>
+
+                          {alertDetail.flow && (
+                            <div className="border-t border-white/10 pt-3 space-y-1.5 text-xs">
+                              <div className="flex justify-between">
+                                <span className="text-slate-400">Source</span>
+                                <span className="font-mono text-slate-200">
+                                  {alertDetail.flow.src_ip}:
+                                  {alertDetail.flow.src_port}
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span className="text-slate-400">
+                                  Destination
+                                </span>
+                                <span className="font-mono text-slate-200">
+                                  {alertDetail.flow.dst_ip}:
+                                  {alertDetail.flow.dst_port}
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span className="text-slate-400">Protocol</span>
+                                <span className="font-mono text-cyan-300">
+                                  {alertDetail.flow.proto}
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span className="text-slate-400">
+                                  Capture source
+                                </span>
+                                <span className="font-mono text-slate-200">
+                                  {alertDetail.flow.source}
+                                </span>
+                              </div>
+                            </div>
+                          )}
+
+                          <div className="border-t border-white/10 pt-3">
+                            <div className="text-xs font-semibold text-white mb-2.5">
+                              Why flagged · SHAP
+                            </div>
+                            <div className="space-y-2 text-xs">
+                              {parsedEvidence.shap
+                                .slice(0, 5)
+                                .map((item, idx) => {
+                                  const imp = Number(
+                                    item.importance_score || 0,
+                                  );
+                                  const widthPct = Math.min(
+                                    100,
+                                    Math.max(8, Math.abs(imp) * 35),
+                                  );
+                                  return (
+                                    <div
+                                      key={idx}
+                                      className="flex items-center justify-between gap-2"
+                                    >
+                                      <span
+                                        className="text-slate-300 truncate w-36"
+                                        title={item.feature}
+                                      >
+                                        {item.feature}
+                                      </span>
+                                      <div className="flex-1 h-2 bg-slate-800 rounded-full overflow-hidden">
+                                        <div
+                                          className={`h-full ${imp >= 0 ? "bg-rose-400" : "bg-emerald-400"}`}
+                                          style={{ width: `${widthPct}%` }}
+                                        />
+                                      </div>
+                                      <span className="font-mono text-[11px] text-slate-300 w-12 text-right">
+                                        {imp >= 0
+                                          ? `+${imp.toFixed(2)}`
+                                          : imp.toFixed(2)}
+                                      </span>
+                                    </div>
+                                  );
+                                })}
+                            </div>
+                          </div>
+
+                          <div className="border-t border-white/10 pt-3 space-y-1 text-xs">
+                            <div className="flex justify-between">
+                              <span className="text-slate-400">XGBoost</span>
+                              <span className="font-mono text-slate-200">
+                                {Number(
+                                  parsedEvidence.scores.xgb_binary_prob || 0,
+                                ).toFixed(4)}
+                              </span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span className="text-slate-400">
+                                Random Forest
+                              </span>
+                              <span className="font-mono text-slate-200">
+                                {Number(
+                                  parsedEvidence.scores.rf_binary_prob || 0,
+                                ).toFixed(4)}
+                              </span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span className="text-slate-400">
+                                Isolation Forest
+                              </span>
+                              <span className="font-mono text-slate-200">
+                                {Number(
+                                  parsedEvidence.scores
+                                    .isolation_forest_anomaly_score || 0,
+                                ).toFixed(4)}
+                              </span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span className="text-slate-400">
+                                Model version
+                              </span>
+                              <span className="font-mono text-cyan-300">
+                                {alertDetail.model_version}
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-2 pt-2">
+                            <button
+                              onClick={() =>
+                                handleUpdateStatus(
+                                  alertDetail.id,
+                                  "acknowledged",
+                                )
+                              }
+                              className="py-2 px-3 rounded-xl text-xs font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/30"
+                            >
+                              Acknowledge
+                            </button>
+                            <button
+                              onClick={() =>
+                                handleUpdateStatus(
+                                  alertDetail.id,
+                                  "false_positive",
+                                )
+                              }
+                              className="py-2 px-3 rounded-xl text-xs font-semibold bg-slate-800 text-slate-300 border border-white/10 hover:bg-slate-700"
+                            >
+                              False positive
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="text-xs text-slate-400 py-10 text-center">
+                          Select an alert to inspect SHAP evidence.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* TRAFFIC TAB */}
+              {tab === "traffic" && (
+                <div className="space-y-5">
+                  {/* Traffic KPI cards */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+                    {[
+                      {
+                        label: "Network throughput",
+                        value: (() => {
+                          const latest = trafficSeries[trafficSeries.length - 1];
+                          const bytesPerSec = latest
+                            ? Number(latest.forward_bytes_per_sec || 0) +
+                              Number(latest.reverse_bytes_per_sec || 0)
+                            : 0;
+                          return bytesPerSec >= 1048576
+                            ? `${(bytesPerSec / 1048576).toFixed(2)} MB/s`
+                            : bytesPerSec >= 1024
+                              ? `${(bytesPerSec / 1024).toFixed(1)} KB/s`
+                              : `${bytesPerSec.toFixed(0)} B/s`;
+                        })(),
+                        color: "bg-cyan-400",
+                        values: trafficSeries.map(point =>
+                          Number(point.forward_bytes_per_sec || 0) +
+                          Number(point.reverse_bytes_per_sec || 0)
+                        ),
+                        note: "Latest observed rate",
+                      },
+                      {
+                        label: "Packets per second",
+                        value: `${Number(trafficSeries[trafficSeries.length - 1]?.packets_per_sec || 0).toLocaleString(undefined, { maximumFractionDigits: 1 })}`,
+                        color: "bg-violet-400",
+                        values: trafficSeries.map(point => Number(point.packets_per_sec || 0)),
+                        note: "Latest observed rate",
+                      },
+                      {
+                        label: "Observed flows",
+                        value: Number(trafficSeries[trafficSeries.length - 1]?.flow_count || 0).toLocaleString(),
+                        color: "bg-emerald-400",
+                        values: trafficSeries.map(point => Number(point.flow_count || 0)),
+                        note: "Latest time bucket",
+                      },
+                      {
+                        label: "Dropped flows",
+                        value: "Not tracked",
+                        color: "bg-amber-400",
+                        values: [],
+                        note: "Capture drop counter unavailable",
+                      },
+                    ].map((metric) => {
+                      const max = Math.max(1, ...metric.values);
+                      const bars = metric.values.length
+                        ? metric.values.map(value => Math.max(0, (value / max) * 100))
+                        : [];
+
+                      return (
+                        <div
+                          key={metric.label}
+                          className="glass-card rounded-2xl p-5"
+                        >
+                          <div className="text-xs text-slate-300 mb-3">
+                            {metric.label}
+                          </div>
+                          <div className="flex items-end justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="text-2xl font-bold text-white truncate">
+                                {metric.value}
+                              </div>
+                              <div className="text-[11px] text-slate-400 mt-1">
+                                {metric.note}
+                              </div>
+                            </div>
+                            <MiniBars
+                              color={metric.color}
+                              values={bars}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <WaveChart
+                    title="Network throughput"
+                    subtitle="Captured forward and reverse traffic · bytes per second"
+                    data={trafficSeries}
+                    windowValue={trafficWindow}
+                    onWindowChange={setTrafficWindow}
+                    chartId="traffic-throughput"
+                    unit="bytes"
+                    series={[
+                      {
+                        key: "forward_bytes_per_sec",
+                        label: "Forward",
+                        color: "#22d3ee",
+                      },
+                      {
+                        key: "reverse_bytes_per_sec",
+                        label: "Reverse",
+                        color: "#a78bfa",
+                      },
+                    ]}
+                  />
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+                    <div className="glass-card rounded-2xl p-5">
+                      <h2 className="text-sm font-semibold text-white mb-4">
+                        Protocols
+                      </h2>
+                      <div className="space-y-4 text-xs">
+                        {["TCP", "UDP", "ICMP", "Other"].map((proto) => {
+                          const cnt = traffic.protocols?.[proto] || 0;
+                          const pct =
+                            traffic.total_sampled > 0
+                              ? Math.round((cnt / traffic.total_sampled) * 100)
+                              : 0;
+                          return (
+                            <div key={proto}>
+                              <div className="flex justify-between mb-1">
+                                <span className="text-slate-200 font-medium">
+                                  {proto}
+                                </span>
+                                <span className="font-mono text-cyan-300">
+                                  {pct}% ({cnt})
+                                </span>
+                              </div>
+                              <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                                <div
+                                  className="h-full bg-cyan-400"
+                                  style={{ width: `${pct}%` }}
+                                />
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    <div className="glass-card rounded-2xl p-5">
+                      <h2 className="text-sm font-semibold text-white mb-4">
+                        Top talkers
+                      </h2>
+                      <table className="w-full text-left text-xs">
+                        <thead>
+                          <tr className="text-slate-400 border-b border-white/10">
+                            <th className="pb-2">HOST</th>
+                            <th className="pb-2">FLOWS</th>
+                            <th className="pb-2">MB</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-white/5">
+                          {(traffic.top_talkers || []).map((t) => (
+                            <tr key={t.host}>
+                              <td className="py-2.5 font-mono text-slate-200">
+                                {t.host}
+                              </td>
+                              <td className="py-2.5 font-mono text-cyan-300">
+                                {t.flows}
+                              </td>
+                              <td className="py-2.5 font-mono text-slate-400">
+                                {t.mb}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    <div className="glass-card rounded-2xl p-5">
+                      <h2 className="text-sm font-semibold text-white mb-4">
+                        Top ports
+                      </h2>
+                      <div className="space-y-3.5 text-xs">
+                        {(traffic.top_ports || []).map((p) => {
+                          const pct =
+                            traffic.total_sampled > 0
+                              ? Math.round(
+                                  (p.count / traffic.total_sampled) * 100,
+                                )
+                              : 0;
+                          return (
+                            <div key={p.port}>
+                              <div className="flex justify-between mb-1">
+                                <span className="font-mono text-slate-200">
+                                  {p.port} • {PORT_LABELS[p.port] || "SVC"}
+                                </span>
+                                <span className="font-mono text-cyan-300">
+                                  {pct}%
+                                </span>
+                              </div>
+                              <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                                <div
+                                  className="h-full bg-indigo-400"
+                                  style={{ width: `${pct}%` }}
+                                />
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* MODELS TAB */}
+              {tab === "models" && (
+                <div className="space-y-5">
+                  {/* PERFORMANCE KPI CARDS */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+                    {[
+                      {
+                        label: "Precision",
+                        value: "0.9678",
+                        color: "bg-cyan-400",
+                        accent: "text-cyan-400",
+                        note: "Live test",
+                      },
+                      {
+                        label: "Recall",
+                        value: "0.9998",
+                        color: "bg-violet-400",
+                        accent: "text-violet-400",
+                        note: "Live test",
+                      },
+                      {
+                        label: "F1 score",
+                        value: "0.9835",
+                        color: "bg-emerald-400",
+                        accent: "text-emerald-400",
+                        note: "Live test",
+                      },
+                      {
+                        label: "False positive rate",
+                        value: "0.88%",
+                        color: "bg-amber-400",
+                        accent: "text-amber-400",
+                        note: "Target ≤ 1.0%",
+                      },
+                    ].map((metric) => (
+                      <div
+                        key={metric.label}
+                        className="glass-card rounded-2xl p-5 relative overflow-hidden"
+                      >
+                        <div className="flex items-center gap-2 text-xs text-slate-400">
+                          <span
+                            className={`w-2 h-2 rounded-full ${metric.color}`}
+                          />
+                          {metric.label}
+                        </div>
+                        <div className="text-3xl font-bold text-white mt-2 tabular-nums">
+                          {metric.value}
+                        </div>
+                        <div className="mt-3 flex items-end justify-between gap-3">
+                          <span className="text-[10px] text-slate-500">
+                            V3 evaluation indicator
+                          </span>
+                          <MiniBars
+                            color={metric.color}
+                            values={Array(12).fill(
+                              metric.label === "False positive rate"
+                                ? 88
+                                : Math.round(parseFloat(metric.value) * 100),
+                            )}
+                          />
+                        </div>
+                        <div className={`text-xs mt-3 ${metric.accent}`}>
+                          {metric.note}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* CLASS PERFORMANCE + DRIFT */}
+                  <div className="grid grid-cols-1 xl:grid-cols-5 gap-5">
+                    <div className="glass-card rounded-2xl p-5 xl:col-span-3">
+                      <div className="flex items-center justify-between mb-1">
+                        <h2 className="text-sm font-semibold text-white">
+                          Per-class detection performance
+                        </h2>
+                      </div>
+                      <p className="text-xs text-slate-400 mb-5">
+                        Detection rate across the four evaluated traffic
+                        families
+                      </p>
+
+                      <div className="grid grid-cols-12 gap-2 px-3 pb-2 text-[10px] uppercase tracking-wide text-slate-500 border-b border-white/10">
+                        <span className="col-span-4">Class</span>
+                        <span className="col-span-3 text-right">Detected</span>
+                        <span className="col-span-3 text-right">Support</span>
+                        <span className="col-span-2 text-right">Recall</span>
+                      </div>
+
+                      {[
+                        {
+                          name: "Benign",
+                          detected: 52022,
+                          support: 52486,
+                          recall: "99.12%",
+                          color: "bg-emerald-400",
+                        },
+                        {
+                          name: "DoS / DDoS",
+                          detected: 12799,
+                          support: 12800,
+                          recall: "99.99%",
+                          color: "bg-rose-400",
+                        },
+                        {
+                          name: "Brute Force",
+                          detected: 908,
+                          support: 908,
+                          recall: "100%",
+                          color: "bg-amber-400",
+                        },
+                        {
+                          name: "PortScan",
+                          detected: 191,
+                          support: 193,
+                          recall: "98.96%",
+                          color: "bg-cyan-400",
+                        },
+                      ].map((item) => (
+                        <div
+                          key={item.name}
+                          className="grid grid-cols-12 gap-2 items-center px-3 py-4 border-b border-white/5 text-xs"
+                        >
+                          <span className="col-span-4 text-slate-300 font-medium">
+                            {item.name}
+                          </span>
+                          <span className="col-span-3 text-right text-slate-300 tabular-nums">
+                            {item.detected.toLocaleString()}
+                          </span>
+                          <span className="col-span-3 text-right text-slate-400 tabular-nums">
+                            {item.support.toLocaleString()}
+                          </span>
+                          <span className="col-span-2 text-right text-emerald-400 font-semibold tabular-nums">
+                            {item.recall}
+                          </span>
+                          <div className="col-span-12 h-1.5 rounded-full bg-slate-800 overflow-hidden">
+                            <div
+                              className={`h-full rounded-full ${item.color}`}
+                              style={{ width: item.recall }}
+                            />
+                          </div>
+                        </div>
+                      ))}
+
+                      <p className="text-[10px] text-slate-500 mt-4">
+                        Detection rate is calculated from the V3 end-to-end
+                        held-out evaluation. Benign shows the correctly
+                        classified benign share.
+                      </p>
+                    </div>
+                    <div className="xl:col-span-2 space-y-3">
+                      <WaveChart
+                        title="Live Traffic Signal"
+                        subtitle="Observed forward and reverse traffic throughput"
+                        data={trafficSeries}
+                        windowValue={trafficWindow}
+                        onWindowChange={setTrafficWindow}
+                        chartId="models-live-traffic"
+                        unit="bytes"
+                        series={[
+                          {
+                            key: "forward_bytes_per_sec",
+                            label: "Forward traffic",
+                            color: "#22d3ee",
+                          },
+                          {
+                            key: "reverse_bytes_per_sec",
+                            label: "Reverse traffic",
+                            color: "#a78bfa",
+                          },
+                        ]}
+                      />
+                      {(() => {
+                        const featureEntries = Object.entries(
+                          driftData?.feature_psi || {},
+                        )
+                          .filter(([, value]) => Number.isFinite(Number(value)))
+                          .sort((a, b) => Number(b[1]) - Number(a[1]));
+
+                        const highestFeature = featureEntries[0];
+                        const psi = Number(driftData?.overall_psi);
+                        const hasScore =
+                          driftData?.overall_psi != null &&
+                          Number.isFinite(psi);
+
+                        const status = driftData?.status;
+                        const statusConfig = {
+                          stable: {
+                            label: "Stable",
+                            style:
+                              "bg-emerald-500/10 text-emerald-300 border-emerald-500/20",
+                          },
+                          moderate_drift: {
+                            label: "Moderate drift",
+                            style:
+                              "bg-amber-500/10 text-amber-300 border-amber-500/20",
+                          },
+                          significant_drift: {
+                            label: "Significant drift",
+                            style:
+                              "bg-rose-500/10 text-rose-300 border-rose-500/20",
+                          },
+                          insufficient_data: {
+                            label: "Insufficient data",
+                            style:
+                              "bg-slate-500/10 text-slate-300 border-slate-500/20",
+                          },
+                        };
+
+                        const config = statusConfig[status] || {
+                          label: driftError
+                            ? "Unavailable"
+                            : driftData
+                              ? "Unknown status"
+                              : "Loading",
+                          style:
+                            "bg-slate-500/10 text-slate-300 border-slate-500/20",
+                        };
+
+                        const history = Array.isArray(driftData?.history)
+                          ? driftData.history.slice(-12)
+                          : [];
+
+                        const maxHistory = Math.max(
+                          0.01,
+                          ...history.map(
+                            (item) => Number(item.overall_psi) || 0,
+                          ),
+                        );
+
+                        return (
+                          <div className="glass-card rounded-xl p-4 space-y-4">
+                            <div className="flex flex-wrap items-center justify-between gap-3">
+                              <div>
+                                <div className="text-xs font-semibold text-slate-200">
+                                  Feature drift monitoring
+                                </div>
+                                <p className="text-[11px] text-slate-500 mt-1">
+                                  Population Stability Index (PSI), comparing
+                                  live traffic against the V3 training baseline.
+                                </p>
+                              </div>
+                              <span
+                                className={`px-2.5 py-1 rounded-full text-[10px] border ${config.style}`}
+                              >
+                                {config.label}
+                              </span>
+                            </div>
+
+                            {driftError && (
+                              <p className="text-xs text-rose-300">
+                                {driftError}
+                              </p>
+                            )}
+
+                            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                              <div className="rounded-lg bg-white/[0.03] p-3">
+                                <p className="text-[10px] text-slate-500">
+                                  Overall PSI
+                                </p>
+                                <p className="text-xl font-semibold text-white mt-1">
+                                  {hasScore ? psi.toFixed(4) : "—"}
+                                </p>
+                              </div>
+
+                              <div className="rounded-lg bg-white/[0.03] p-3">
+                                <p className="text-[10px] text-slate-500">
+                                  Live samples
+                                </p>
+                                <p className="text-xl font-semibold text-white mt-1">
+                                  {(
+                                    driftData?.sample_count ?? 0
+                                  ).toLocaleString()}
+                                </p>
+                              </div>
+
+                              <div className="rounded-lg bg-white/[0.03] p-3">
+                                <p className="text-[10px] text-slate-500">
+                                  Features monitored
+                                </p>
+                                <p className="text-xl font-semibold text-white mt-1">
+                                  {driftData?.informative_feature_count ?? "—"}
+                                </p>
+                              </div>
+
+                              <div className="rounded-lg bg-white/[0.03] p-3">
+                                <p className="text-[10px] text-slate-500">
+                                  Highest drift
+                                </p>
+                                <p
+                                  className="text-sm font-semibold text-white mt-1 truncate"
+                                  title={highestFeature?.[0] || ""}
+                                >
+                                  {highestFeature
+                                    ? Number(highestFeature[1]).toFixed(4)
+                                    : "—"}
+                                </p>
+                                <p className="text-[10px] text-slate-500 truncate">
+                                  {highestFeature?.[0] || "No feature data"}
+                                </p>
+                              </div>
+                            </div>
+
+                            <div>
+                              <div className="flex items-center justify-between mb-2">
+                                <p className="text-[11px] font-medium text-slate-300">
+                                  PSI history
+                                </p>
+                                <p className="text-[10px] text-slate-500">
+                                  Latest {history.length} observations
+                                </p>
+                              </div>
+
+                              {(() => {
+                                const points = history
+                                  .map((item) => ({
+                                    value: Number(item.overall_psi),
+                                    timestamp: item.timestamp,
+                                    flowId: item.latest_flow_id,
+                                  }))
+                                  .filter(
+                                    (item) =>
+                                      Number.isFinite(item.value) &&
+                                      item.value >= 0 &&
+                                      typeof item.timestamp === "string" &&
+                                      !Number.isNaN(Date.parse(item.timestamp)),
+                                  );
+
+                                if (!points.length) {
+                                  return (
+                                    <p className="text-[11px] text-slate-500 py-5">
+                                      History will appear as new live traffic is
+                                      observed.
+                                    </p>
+                                  );
+                                }
+
+                                const width = 720;
+                                const height = 190;
+                                const left = 18;
+                                const right = 702;
+                                const top = 18;
+                                const bottom = 145;
+                                const plotWidth = right - left;
+                                const plotHeight = bottom - top;
+
+                                const maxObserved = points.reduce(
+                                  (max, point) => Math.max(max, point.value),
+                                  0,
+                                );
+                                const maxValue = Math.max(
+                                  0.25,
+                                  maxObserved * 1.1,
+                                );
+
+                                const plotted = points.map((point, index) => ({
+                                  ...point,
+                                  x:
+                                    points.length === 1
+                                      ? (left + right) / 2
+                                      : left +
+                                        (index / (points.length - 1)) *
+                                          plotWidth,
+                                  y:
+                                    bottom -
+                                    (point.value / maxValue) * plotHeight,
+                                }));
+
+                                const linePath = plotted.reduce(
+                                  (path, point, index) => {
+                                    if (index === 0) {
+                                      return `M ${point.x} ${point.y}`;
+                                    }
+
+                                    const previous = plotted[index - 1];
+                                    const beforePrevious =
+                                      plotted[index - 2] || previous;
+                                    const next = plotted[index + 1] || point;
+
+                                    const cp1x =
+                                      previous.x +
+                                      (point.x - beforePrevious.x) / 6;
+                                    const cp1y =
+                                      previous.y +
+                                      (point.y - beforePrevious.y) / 6;
+                                    const cp2x =
+                                      point.x - (next.x - previous.x) / 6;
+                                    const cp2y =
+                                      point.y - (next.y - previous.y) / 6;
+
+                                    return (
+                                      `${path} C ${cp1x} ${cp1y}, ` +
+                                      `${cp2x} ${cp2y}, ${point.x} ${point.y}`
+                                    );
+                                  },
+                                  "",
+                                );
+
+                                const areaPath =
+                                  plotted.length > 1
+                                    ? `${linePath} L ${plotted[plotted.length - 1].x} ${bottom} L ${plotted[0].x} ${bottom} Z`
+                                    : "";
+
+                                const thresholdY =
+                                  bottom - (0.2 / maxValue) * plotHeight;
+
+                                const labelIndexes =
+                                  plotted.length <= 4
+                                    ? plotted.map((_, index) => index)
+                                    : [
+                                        0,
+                                        Math.round((plotted.length - 1) / 3),
+                                        Math.round(
+                                          ((plotted.length - 1) * 2) / 3,
+                                        ),
+                                        plotted.length - 1,
+                                      ];
+
+                                return (
+                                  <div className="rounded-lg bg-slate-950/40 border border-white/5 px-2 pt-3 pb-1">
+                                    <svg
+                                      viewBox={`0 0 ${width} ${height}`}
+                                      className="w-full h-auto"
+                                      role="img"
+                                      aria-label="Population Stability Index history chart"
+                                    >
+                                      <defs>
+                                        <linearGradient
+                                          id="psiWaveGradient"
+                                          x1="0"
+                                          y1="0"
+                                          x2="0"
+                                          y2="1"
+                                        >
+                                          <stop
+                                            offset="0%"
+                                            stopColor="#22d3ee"
+                                            stopOpacity="0.32"
+                                          />
+                                          <stop
+                                            offset="100%"
+                                            stopColor="#22d3ee"
+                                            stopOpacity="0.01"
+                                          />
+                                        </linearGradient>
+                                      </defs>
+
+                                      <line
+                                        x1={left}
+                                        y1={thresholdY}
+                                        x2={right}
+                                        y2={thresholdY}
+                                        stroke="#fb7185"
+                                        strokeWidth="1.5"
+                                        strokeDasharray="5 5"
+                                        opacity="0.9"
+                                      />
+
+                                      <text
+                                        x={right - 2}
+                                        y={Math.max(12, thresholdY - 6)}
+                                        textAnchor="end"
+                                        fill="#fb7185"
+                                        fontSize="10"
+                                      >
+                                        Threshold 0.20
+                                      </text>
+
+                                      {plotted.length > 1 && (
+                                        <path
+                                          d={areaPath}
+                                          fill="url(#psiWaveGradient)"
+                                        />
+                                      )}
+
+                                      {plotted.length > 1 && (
+                                        <path
+                                          d={linePath}
+                                          fill="none"
+                                          stroke="#22d3ee"
+                                          strokeWidth="2.5"
+                                          strokeLinecap="round"
+                                          strokeLinejoin="round"
+                                        />
+                                      )}
+
+                                      {plotted.map((point, index) => (
+                                        <circle
+                                          key={`${point.flowId ?? "point"}-${index}`}
+                                          cx={point.x}
+                                          cy={point.y}
+                                          r="3.5"
+                                          fill="#22d3ee"
+                                          stroke="#0f172a"
+                                          strokeWidth="1.5"
+                                        >
+                                          <title>
+                                            {`PSI: ${point.value.toFixed(4)} · ${new Date(point.timestamp).toLocaleString()}`}
+                                          </title>
+                                        </circle>
+                                      ))}
+
+                                      {labelIndexes.map((index) => {
+                                        const point = plotted[index];
+
+                                        return (
+                                          <text
+                                            key={`time-${index}`}
+                                            x={point.x}
+                                            y="174"
+                                            textAnchor={
+                                              index === 0
+                                                ? "start"
+                                                : index === plotted.length - 1
+                                                  ? "end"
+                                                  : "middle"
+                                            }
+                                            fill="#64748b"
+                                            fontSize="10"
+                                          >
+                                            {new Date(
+                                              point.timestamp,
+                                            ).toLocaleDateString(undefined, {
+                                              day: "numeric",
+                                              month: "short",
+                                            })}
+                                          </text>
+                                        );
+                                      })}
+                                    </svg>
+
+                                    {plotted.length === 1 && (
+                                      <p className="text-center text-[10px] text-slate-500 pb-2">
+                                        One observation recorded. More live
+                                        traffic is needed to establish a trend.
+                                      </p>
+                                    )}
+                                  </div>
+                                );
+                              })()}
+                            </div>
+
+                            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/5 pt-3">
+                              <p className="text-[10px] text-slate-500">
+                                Baseline:{" "}
+                                {driftData?.reference_source
+                                  ? "V3 training data"
+                                  : "Unavailable"}
+                                {" · "}
+                                {driftData?.feature_count ?? "—"} total features
+                              </p>
+                              <p className="text-[10px] text-slate-500">
+                                Stable: &lt; 0.10 · Moderate: 0.10–0.20 ·
+                                Significant: ≥ 0.20
+                              </p>
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </div>
+                  </div>
+
+                  {/* DEPLOYMENT + THRESHOLDS */}
+                  <div className="grid grid-cols-1 xl:grid-cols-5 gap-5">
+                    <div className="glass-card rounded-2xl p-5 xl:col-span-3">
+                      <h2 className="text-sm font-semibold text-white">
+                        Model deployment
+                      </h2>
+                      <p className="text-xs text-slate-400 mt-1 mb-4">
+                        Currently loaded V3 ensemble artifacts
+                      </p>
+
+                      <div className="flex items-center justify-between rounded-xl bg-white/[0.03] border border-white/5 p-4 mb-4">
+                        <div>
+                          <div className="text-xs text-slate-400">
+                            Active artifact version
+                          </div>
+                          <div className="text-2xl font-bold text-white mt-1">
+                            {modelInfo.active_version || "v3.0.0"}
+                          </div>
+                          <div className="text-xs text-emerald-400 mt-1">
+                            Platt-calibrated probabilities
+                          </div>
+                        </div>
+                        <span className="px-3 py-1 rounded-full bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 text-xs">
+                          Deployed
+                        </span>
+                      </div>
+
+                      <div className="divide-y divide-white/5">
+                        {(modelInfo.detectors || []).map((d) => (
+                          <div
+                            key={d.name}
+                            className="py-3 flex items-center justify-between gap-3"
+                          >
+                            <div>
+                              <div className="text-xs font-semibold text-slate-200">
+                                {d.name}
+                              </div>
+                              <div className="text-xs text-slate-500 mt-1">
+                                {d.role}
+                              </div>
+                            </div>
+                            <span className="shrink-0 px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 text-[10px]">
+                              Loaded
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div className="border-t border-white/10 mt-3 pt-3 text-xs text-slate-500">
+                        Evaluation snapshot: Live test · 66,387 flows
+                      </div>
+                    </div>
+
+                    <div className="glass-card rounded-2xl p-5 xl:col-span-2">
+                      <h2 className="text-sm font-semibold text-white">
+                        Detection configuration
+                      </h2>
+                      <p className="text-xs text-slate-400 mt-1 mb-5">
+                        Active V3 decision thresholds
+                      </p>
+
+                      {[
+                        { name: "XGBoost threshold", value: "0.000756831956" },
+                        {
+                          name: "Random Forest threshold",
+                          value: "0.009017518885",
+                        },
+                        { name: "Suspicious threshold", value: "0.55" },
+                        { name: "Anomaly threshold", value: "0.08" },
+                      ].map((item) => (
+                        <div
+                          key={item.name}
+                          className="flex items-center justify-between gap-3 py-3 border-b border-white/5"
+                        >
+                          <span className="text-xs text-slate-400">
+                            {item.name}
+                          </span>
+                          <span className="font-mono text-xs text-cyan-300">
+                            {item.value}
+                          </span>
+                        </div>
+                      ))}
+
+                      <div className="mt-5 rounded-xl bg-cyan-500/5 border border-cyan-500/10 p-3">
+                        <div className="text-xs text-cyan-300 font-semibold">
+                          Calibration
+                        </div>
+                        <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">
+                          Binary detector probabilities use Platt calibration.
+                          Thresholds are read-only here and remain controlled by
+                          the deployed V3 configuration.
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* CAPTURE PAGE */}
+              {tab === "capture" && (
+                <div className="space-y-5">
+                  <div className="rounded-xl border border-amber-400/30 bg-amber-500/10 px-5 py-3 text-xs text-amber-200">
+                    <strong>Authorised monitoring only.</strong> Capture traffic
+                    only on networks you own or have permission to monitor. This
+                    dashboard monitors the host-managed worker; it does not
+                    start or stop it.
+                  </div>
+
+                  <div className="grid grid-cols-1 xl:grid-cols-12 gap-5">
+                    <section className="glass-card rounded-2xl p-5 xl:col-span-4 space-y-5">
+                      <div className="flex items-center justify-between gap-3">
+                        <h2 className="text-base font-semibold text-white">
+                          Capture control
+                        </h2>
+                        <span
+                          className={`px-3 py-1 rounded-full text-xs border ${captureStatus.worker_active ? "bg-emerald-500/10 text-emerald-300 border-emerald-500/30" : "bg-slate-500/10 text-slate-300 border-slate-500/30"}`}
+                        >
+                          <span className="mr-1">●</span>
+                          {captureStatus.worker_active ? "Running" : "Standby"}
+                        </span>
+                      </div>
+                      <div>
+                        <label className="text-xs text-slate-400">
+                          Capture interface
+                        </label>
+                        <div className="mt-2 rounded-xl bg-slate-900/60 border border-white/10 p-3 font-mono text-sm text-cyan-200">
+                          {captureStatus.interface || "Not configured"}
+                        </div>
+                      </div>
+                      <div>
+                        <label className="text-xs text-slate-400">
+                          Authorised capture filter
+                        </label>
+                        <div className="mt-2 rounded-xl bg-slate-900/60 border border-white/10 p-3 font-mono text-xs text-slate-300 break-all">
+                          {captureStatus.bpf_filter || "Not reported"}
+                        </div>
+                      </div>
+                      <div className="rounded-xl border border-white/10 bg-white/[0.03] p-4 space-y-3">
+                        <div className="flex justify-between text-xs">
+                          <span className="text-slate-400">Session</span>
+                          <span className="font-mono text-slate-200">
+                            {captureStatus.session_id
+                              ? captureStatus.session_id.slice(0, 8)
+                              : "Not reported"}
+                          </span>
+                        </div>
+                        <div className="flex justify-between text-xs">
+                          <span className="text-slate-400">Uptime</span>
+                          <span className="font-mono text-cyan-300">
+                            {captureStatus.uptime_seconds != null
+                              ? `${Math.floor(captureStatus.uptime_seconds / 3600)}h ${Math.floor((captureStatus.uptime_seconds % 3600) / 60)}m`
+                              : "Not available"}
+                          </span>
+                        </div>
+                        <div className="flex justify-between text-xs">
+                          <span className="text-slate-400">
+                            Last live ingest
+                          </span>
+                          <span className="font-mono text-slate-300 text-right">
+                            {captureStatus.last_live_ingest
+                              ? new Date(
+                                  captureStatus.last_live_ingest,
+                                ).toLocaleString()
+                              : "Not available"}
+                          </span>
+                        </div>
+                      </div>
+                      <p className="text-[11px] leading-relaxed text-slate-500">
+                        Capture is managed by the host system service.
+                        Start/stop actions remain in system administration, not
+                        this dashboard.
+                      </p>
+                    </section>
+
+                    <div className="xl:col-span-8 space-y-5">
+                      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                        {[
+                          {
+                            label: "Flows / sec",
+                            value: Number(
+                              captureStatus.flows_per_sec || 0,
+                            ).toFixed(2),
+                            note: `${Number(captureStatus.flows_completed_total || 0).toLocaleString()} completed`,
+                            color: "text-cyan-300",
+                            bars: captureSeries.map((x) => x.flow_rate),
+                          },
+                          {
+                            label: "Queue depth",
+                            value: Number(
+                              captureStatus.pending_flows || 0,
+                            ).toLocaleString(),
+                            note: "Pending flow batches",
+                            color: "text-amber-300",
+                            bars: captureSeries.map((x) => x.queue_depth),
+                          },
+                          {
+                            label: "Dropped flows",
+                            value: Number(
+                              captureStatus.flows_abandoned_total || 0,
+                            ).toLocaleString(),
+                            note: "Abandoned at shutdown",
+                            color: "text-emerald-300",
+                            bars: [],
+                          },
+                          {
+                            label: "Flow → alert",
+                            value: "Not measured",
+                            note: "Latency instrumentation unavailable",
+                            color: "text-violet-300",
+                            bars: [],
+                          },
+                        ].map((item) => {
+                          const max = Math.max(1, ...item.bars);
+                          const bars = item.bars
+                            .slice(-12)
+                            .map((v) =>
+                              Math.max(8, Math.round((v / max) * 100)),
+                            );
+                          return (
+                            <div
+                              key={item.label}
+                              className="glass-card rounded-2xl p-4 min-w-0"
+                            >
+                              <div className="text-xs text-slate-400">
+                                {item.label}
+                              </div>
+                              <div
+                                className={`text-2xl font-bold mt-2 tabular-nums ${item.color}`}
+                              >
+                                {item.value}
+                              </div>
+                              <div className="text-[10px] text-slate-500 mt-1">
+                                {item.note}
+                              </div>
+                              {bars.length > 0 && (
+                                <div className="mt-2">
+                                  <MiniBars
+                                    color={
+                                      item.label === "Queue depth"
+                                        ? "bg-amber-400"
+                                        : "bg-cyan-400"
+                                    }
+                                    values={bars}
+                                  />
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      <WaveChart
+                        title="Flow rate and queue depth"
+                        subtitle="Live samples collected from the capture worker heartbeat"
+                        data={captureSeries}
+                        series={[
+                          {
+                            key: "flow_rate",
+                            label: "Flows / sec",
+                            color: "#22d3ee",
+                          },
+                          {
+                            key: "queue_depth",
+                            label: "Queue depth",
+                            color: "#fbbf24",
+                          },
+                        ]}
+                        chartId="capture-flow-queue"
+                        unit="flows"
+                        showWindowControls={false}
+                        footerLabel="Observed worker telemetry · latest 60 samples"
+                      />
+                    </div>
+                  </div>
+
+                  <section className="glass-card rounded-2xl p-5">
+                    <h2 className="text-sm font-semibold text-white">
+                      Pipeline health
+                    </h2>
+                    <p className="text-xs text-slate-400 mt-1 mb-5">
+                      Capture worker → flow records → V3 detection → persisted
+                      alerts
+                    </p>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-3">
+                      {[
+                        {
+                          name: "Capture worker",
+                          detail: captureStatus.interface || "Scapy interface",
+                          active: !!captureStatus.worker_active,
+                        },
+                        {
+                          name: "Flow records",
+                          detail: `${Number(captureStatus.flows_completed_total || 0).toLocaleString()} completed`,
+                          active:
+                            Number(captureStatus.flows_completed_total || 0) >
+                            0,
+                        },
+                        {
+                          name: "Detection API",
+                          detail: `${latencyMs} ms dashboard response`,
+                          active: latencyMs > 0,
+                        },
+                        {
+                          name: "V3 detectors",
+                          detail: `${(modelInfo.detectors || []).length} loaded artifacts`,
+                          active: (modelInfo.detectors || []).length > 0,
+                        },
+                        {
+                          name: "Alert store",
+                          detail: "PostgreSQL-backed API",
+                          active: stats !== null,
+                        },
+                      ].map((item) => (
+                        <div
+                          key={item.name}
+                          className="rounded-xl border border-white/10 bg-white/[0.035] p-3"
+                        >
+                          <div className="text-xs font-semibold text-slate-200">
+                            <span
+                              className={`mr-1 ${item.active ? "text-emerald-400" : "text-slate-500"}`}
+                            >
+                              ●
+                            </span>
+                            {item.name}
+                          </div>
+                          <div className="text-[10px] text-slate-500 mt-2">
+                            {item.detail}
+                          </div>
+                          <div
+                            className={`text-[10px] mt-2 ${item.active ? "text-emerald-300" : "text-slate-500"}`}
+                          >
+                            {item.active
+                              ? "Available"
+                              : "Waiting for telemetry"}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+
+                  <div className="grid grid-cols-1 xl:grid-cols-12 gap-5">
+                    <section className="glass-card rounded-2xl p-5 xl:col-span-4 space-y-4">
+                      <div>
+                        <h2 className="text-sm font-semibold text-white">
+                          Batch flow ingestion
+                        </h2>
+                        <p className="text-xs text-slate-400 mt-1">
+                          Import a flow-feature CSV for V3 analysis
+                        </p>
+                      </div>
+                      <input
+                        type="file"
+                        accept=".csv"
+                        onChange={handleCsvUpload}
+                        className="block w-full text-xs text-slate-300 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-indigo-500/25 file:text-indigo-200 hover:file:bg-indigo-500/35"
+                      />
+                      {uploadStatus && (
+                        <div className="rounded-lg bg-cyan-500/10 border border-cyan-400/20 p-3 text-xs text-cyan-200">
+                          {uploadStatus}
+                        </div>
+                      )}
+                    </section>
+                    <section className="glass-card rounded-2xl p-5 xl:col-span-8">
+                      <h2 className="text-sm font-semibold text-white mb-1">
+                        Recent flow activity
+                      </h2>
+                      <p className="text-xs text-slate-400 mb-4">
+                        Latest records returned by the flow API
+                      </p>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-xs text-left">
+                          <thead className="text-slate-500 uppercase border-b border-white/10">
+                            <tr>
+                              <th className="py-3 pr-3">Source</th>
+                              <th className="py-3 pr-3">Destination</th>
+                              <th className="py-3 pr-3">Protocol</th>
+                              <th className="py-3 pr-3">Origin</th>
+                              <th className="py-3">Time</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {flows.slice(0, 8).map((flow, index) => (
+                              <tr
+                                key={flow.id || index}
+                                className="border-b border-white/5"
+                              >
+                                <td className="py-3 pr-3 font-mono text-slate-300">
+                                  {flow.src_ip}:{flow.src_port}
+                                </td>
+                                <td className="py-3 pr-3 font-mono text-slate-300">
+                                  {flow.dst_ip}:{flow.dst_port}
+                                </td>
+                                <td className="py-3 pr-3 text-cyan-300">
+                                  {flow.proto}
+                                </td>
+                                <td className="py-3 pr-3 text-slate-400">
+                                  {flow.source || "—"}
+                                </td>
+                                <td className="py-3 text-slate-500">
+                                  {flow.ts
+                                    ? new Date(flow.ts).toLocaleString()
+                                    : "—"}
+                                </td>
+                              </tr>
+                            ))}
+                            {!flows.length && (
+                              <tr>
+                                <td
+                                  colSpan="5"
+                                  className="py-6 text-center text-slate-500"
+                                >
+                                  No flow records returned yet.
+                                </td>
+                              </tr>
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    </section>
+                  </div>
+                </div>
+              )}
+
+              {/* NEW REPORTS PAGE */}
+              {tab === "reports" &&
+                (() => {
+                  const cutoff =
+                    reportRange === "all"
+                      ? 0
+                      : Date.now() - Number(reportRange) * 86400000;
+                  const reportAlerts = alerts.filter((a) => {
+                    const time = new Date(
+                      a.created_at || a.timestamp || 0,
+                    ).getTime();
+                    return reportRange === "all" || (time && time >= cutoff);
+                  });
+                  const confirmed = reportAlerts.filter(
+                    (a) => a.level === "confirmed_malicious",
+                  );
+                  const suspicious = reportAlerts.filter(
+                    (a) => a.level === "suspicious",
+                  );
+                  const families = {};
+                  reportAlerts.forEach((a) => {
+                    const name = a.attack_class || "Unclassified";
+                    families[name] = (families[name] || 0) + 1;
+                  });
+                  const generateReport = () => {
+                    const generated = new Date().toLocaleString();
+                    const familyRows = Object.entries(families)
+                      .map(
+                        ([name, count]) =>
+                          `<tr><td>${name}</td><td>${count}</td></tr>`,
+                      )
+                      .join("");
+                    const alertRows = reportAlerts
+                      .map(
+                        (a) =>
+                          `<tr><td>${a.id ?? ""}</td><td>${a.created_at || a.timestamp || ""}</td><td>${a.attack_class || "Unclassified"}</td><td>${a.level || ""}</td><td>${a.status || ""}</td><td>${a.confidence ?? ""}</td></tr>`,
+                      )
+                      .join("");
+                    const modelBlock = includeModelMetrics
+                      ? `<h2>Model information</h2><p>Version: ${modelInfo.active_version || "Unknown"}</p><p>Feature schema: ${modelInfo.schema_name || "Unknown"}</p><p>Feature count: ${modelInfo.feature_count || "Unknown"}</p>`
+                      : "";
+                    const html = `<!doctype html><html><head><meta charset="utf-8"><title>SENTINEL Threat Report</title><style>body{font:14px Arial;color:#172033;margin:36px}h1{color:#312e81}table{width:100%;border-collapse:collapse;margin:16px 0}td,th{padding:9px;border-bottom:1px solid #ddd;text-align:left}.cards{display:flex;gap:14px}.card{padding:16px;background:#eef2ff;border-radius:10px;flex:1}.value{font-size:24px;font-weight:bold}</style></head><body><h1>SENTINEL — Threat Detection Report</h1><p>${reportRange === "all" ? "All available records" : `Last ${reportRange} days`} · Generated ${generated} · ${modelInfo.active_version || "Model version unavailable"}</p><div class="cards"><div class="card">Total alerts<div class="value">${reportAlerts.length}</div></div><div class="card">Confirmed malicious<div class="value">${confirmed.length}</div></div><div class="card">Suspicious<div class="value">${suspicious.length}</div></div></div><h2>Attack family breakdown</h2><table><tr><th>Family</th><th>Count</th></tr>${familyRows || "<tr><td colspan='2'>No records</td></tr>"}</table><h2>Alert records</h2><table><tr><th>ID</th><th>Time</th><th>Class</th><th>Level</th><th>Status</th><th>Confidence</th></tr>${alertRows || "<tr><td colspan='6'>No records</td></tr>"}</table>${includeEvidence ? "<p>SHAP evidence is available from each alert's detail view in SENTINEL.</p>" : ""}${includeTriage ? "<p>Alert triage status is included in the alert records above.</p>" : ""}${modelBlock}<p><small>Source: current SENTINEL API alert feed, limited to the latest 100 returned alerts.</small></p></body></html>`;
+                    const url = URL.createObjectURL(
+                      new Blob([html], { type: "text/html" }),
+                    );
+                    const link = document.createElement("a");
+                    link.href = url;
+                    link.download = `sentinel-threat-report-${new Date().toISOString().slice(0, 10)}.html`;
+                    link.click();
+                    setTimeout(() => URL.revokeObjectURL(url), 1000);
+                    setReportHistory((prev) =>
+                      [
+                        { date: generated, count: reportAlerts.length },
+                        ...prev,
+                      ].slice(0, 8),
+                    );
+                  };
+                  const dailyBuckets = {};
+                  reportAlerts.forEach((alert) => {
+                    const raw = alert.created_at || alert.timestamp;
+                    if (!raw) return;
+                    const date = new Date(raw);
+                    if (Number.isNaN(date.getTime())) return;
+                    const key = date.toISOString().slice(0, 10);
+                    if (!dailyBuckets[key])
+                      dailyBuckets[key] = { total: 0, confirmed: 0 };
+                    dailyBuckets[key].total += 1;
+                    if (alert.level === "confirmed_malicious")
+                      dailyBuckets[key].confirmed += 1;
+                  });
+                  const reportTrend = Object.entries(dailyBuckets)
+                    .sort((a, b) => a[0].localeCompare(b[0]))
+                    .map(([day, counts]) => ({
+                      timestamp: `${day}T12:00:00`,
+                      ...counts,
+                    }));
+                  return (
+                    <div className="grid grid-cols-1 xl:grid-cols-12 gap-5">
+                      <div className="xl:col-span-4 space-y-5">
+                        <section className="glass-card rounded-2xl p-5 space-y-4">
+                          <div className="flex justify-between items-center">
+                            <h2 className="text-base font-semibold text-white">
+                              Generate report
+                            </h2>
+                            <span className="text-cyan-300 text-xl">＋</span>
+                          </div>
+                          <div>
+                            <label className="text-xs text-slate-400">
+                              Date range
+                            </label>
+                            <select
+                              value={reportRange}
+                              onChange={(e) => setReportRange(e.target.value)}
+                              className="mt-2 w-full rounded-xl bg-slate-900 border border-white/15 p-3 text-sm text-slate-200"
+                            >
+                              <option value="7">Last 7 days</option>
+                              <option value="30">Last 30 days</option>
+                              <option value="90">Last 90 days</option>
+                              <option value="all">All available records</option>
+                            </select>
+                          </div>
+                          <div>
+                            <label className="text-xs text-slate-400">
+                              Report template
+                            </label>
+                            <div className="mt-2 rounded-xl bg-slate-900 border border-white/15 p-3 text-sm text-slate-200">
+                              Threat detection summary
+                            </div>
+                          </div>
+                          <div>
+                            <label className="text-xs text-slate-400">
+                              Export format
+                            </label>
+                            <div className="mt-2 flex gap-2">
+                              <span className="px-4 py-2 rounded-lg bg-cyan-400/15 border border-cyan-400/30 text-cyan-300 text-xs">
+                                HTML
+                              </span>
+                              <span className="px-4 py-2 rounded-lg bg-white/5 border border-white/10 text-slate-500 text-xs">
+                                PDF via browser print
+                              </span>
+                            </div>
+                          </div>
+                          <div className="space-y-3 text-xs text-slate-300">
+                            <label className="flex gap-3 items-center">
+                              <input
+                                type="checkbox"
+                                checked={includeEvidence}
+                                onChange={(e) =>
+                                  setIncludeEvidence(e.target.checked)
+                                }
+                              />{" "}
+                              Include SHAP evidence reference
+                            </label>
+                            <label className="flex gap-3 items-center">
+                              <input
+                                type="checkbox"
+                                checked={includeTriage}
+                                onChange={(e) =>
+                                  setIncludeTriage(e.target.checked)
+                                }
+                              />{" "}
+                              Include triage outcomes
+                            </label>
+                            <label className="flex gap-3 items-center">
+                              <input
+                                type="checkbox"
+                                checked={includeModelMetrics}
+                                onChange={(e) =>
+                                  setIncludeModelMetrics(e.target.checked)
+                                }
+                              />{" "}
+                              Include model information
+                            </label>
+                          </div>
+                          <button
+                            onClick={generateReport}
+                            className="w-full rounded-xl bg-cyan-400 hover:bg-cyan-300 text-slate-950 font-semibold py-3 text-sm"
+                          >
+                            Generate HTML report
+                          </button>
+                          <p className="text-[11px] text-slate-500">
+                            Download the HTML report, or open it and choose
+                            Print → Save as PDF.
+                          </p>
+                        </section>
+                        <section className="glass-card rounded-2xl p-5">
+                          <h2 className="text-sm font-semibold text-white mb-4">
+                            Report history
+                          </h2>
+                          {reportHistory.length ? (
+                            reportHistory.map((r, i) => (
+                              <div
+                                key={i}
+                                className="py-3 border-b border-white/5 flex items-center justify-between gap-3 text-xs"
+                              >
+                                <div className="text-slate-300">
+                                  Threat detection summary
+                                  <span className="block text-slate-500 mt-1">
+                                    {r.date} · {r.count} alerts
+                                  </span>
+                                </div>
+                                <span className="px-2.5 py-1 rounded-full bg-cyan-500/10 text-cyan-300 border border-cyan-500/20">
+                                  HTML
+                                </span>
+                              </div>
+                            ))
+                          ) : (
+                            <p className="text-xs text-slate-500">
+                              Reports generated during this session will appear
+                              here.
+                            </p>
+                          )}
+                        </section>
+                      </div>
+
+                      <section className="xl:col-span-8 glass-card rounded-2xl p-5 space-y-5">
+                        <div>
+                          <h2 className="text-lg font-semibold text-white">
+                            Threat summary
+                          </h2>
+                          <p className="text-xs text-slate-400 mt-1">
+                            {reportRange === "all"
+                              ? "All available records"
+                              : `Last ${reportRange} days`}{" "}
+                            · Generated {new Date().toLocaleDateString()} ·
+                            Model {modelInfo.active_version || "unavailable"}
+                          </p>
+                        </div>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                          {[
+                            [
+                              "Total alerts",
+                              reportAlerts.length,
+                              "text-cyan-300",
+                            ],
+                            [
+                              "Confirmed malicious",
+                              confirmed.length,
+                              "text-rose-300",
+                            ],
+                            ["Suspicious", suspicious.length, "text-amber-300"],
+                            [
+                              "Top class",
+                              Object.entries(families).sort(
+                                (a, b) => b[1] - a[1],
+                              )[0]?.[0] || "—",
+                              "text-amber-300",
+                            ],
+                          ].map((x) => (
+                            <div
+                              key={x[0]}
+                              className="rounded-xl border border-white/10 bg-white/[0.035] p-3"
+                            >
+                              <div className="text-[11px] text-slate-400">
+                                {x[0]}
+                              </div>
+                              <div className={`text-xl font-bold mt-2 ${x[2]}`}>
+                                {typeof x[1] === "number"
+                                  ? x[1].toLocaleString()
+                                  : x[1]}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                        <div>
+                          <h3 className="text-sm font-semibold text-white mb-2">
+                            Alerts per day
+                          </h3>
+                          {reportTrend.length > 1 ? (
+                            <WaveChart
+                              title="Daily alert volume"
+                              subtitle="Aggregated from timestamps in the current alert feed"
+                              data={reportTrend}
+                              series={[
+                                {
+                                  key: "total",
+                                  label: "All alerts",
+                                  color: "#22d3ee",
+                                },
+                                {
+                                  key: "confirmed",
+                                  label: "Confirmed malicious",
+                                  color: "#fb7185",
+                                },
+                              ]}
+                              chartId="reports-alert-trend"
+                              unit="alerts"
+                              showWindowControls={false}
+                              timeLabelFormat="date"
+                              footerLabel="Current API feed · latest 100 alert records"
+                            />
+                          ) : (
+                            <div className="rounded-xl border border-dashed border-white/10 p-6 text-center text-xs text-slate-500">
+                              Not enough dated alert records to draw a daily
+                              trend yet.
+                            </div>
+                          )}
+                        </div>
+                        <div>
+                          <h3 className="text-sm font-semibold text-white mb-3">
+                            Attack class breakdown
+                          </h3>
+                          <div className="space-y-3">
+                            {Object.entries(families)
+                              .sort((a, b) => b[1] - a[1])
+                              .map(([name, count]) => (
+                                <div key={name}>
+                                  <div className="flex justify-between text-xs mb-1">
+                                    <span className="text-slate-300">
+                                      {name}
+                                    </span>
+                                    <span className="text-slate-400">
+                                      {count}
+                                    </span>
+                                  </div>
+                                  <div className="h-2 rounded-full bg-slate-800 overflow-hidden">
+                                    <div
+                                      className="h-full bg-gradient-to-r from-cyan-400 to-indigo-500"
+                                      style={{
+                                        width: `${reportAlerts.length ? (count / reportAlerts.length) * 100 : 0}%`,
+                                      }}
+                                    />
+                                  </div>
+                                </div>
+                              ))}
+                            {!Object.keys(families).length && (
+                              <p className="text-xs text-slate-500">
+                                No alert records for this period.
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                        <div>
+                          <h3 className="text-sm font-semibold text-white mb-3">
+                            Top confirmed alerts
+                          </h3>
+                          <div className="overflow-x-auto">
+                            <table className="w-full text-xs text-left">
+                              <thead className="text-slate-500 uppercase border-b border-white/10">
+                                <tr>
+                                  <th className="py-3 pr-3">Time</th>
+                                  <th className="py-3 pr-3">Class</th>
+                                  <th className="py-3 pr-3">Level</th>
+                                  <th className="py-3">Status</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {confirmed.slice(0, 8).map((a, i) => (
+                                  <tr
+                                    key={a.id || i}
+                                    className="border-b border-white/5"
+                                  >
+                                    <td className="py-3 pr-3 text-slate-400">
+                                      {a.created_at || a.timestamp
+                                        ? new Date(
+                                            a.created_at || a.timestamp,
+                                          ).toLocaleString()
+                                        : "—"}
+                                    </td>
+                                    <td className="py-3 pr-3 text-slate-200">
+                                      {a.attack_class || "Unclassified"}
+                                    </td>
+                                    <td className="py-3 pr-3 text-rose-300">
+                                      {a.level || "—"}
+                                    </td>
+                                    <td className="py-3 text-slate-300">
+                                      {a.status || "—"}
+                                    </td>
+                                  </tr>
+                                ))}
+                                {!confirmed.length && (
+                                  <tr>
+                                    <td
+                                      colSpan="4"
+                                      className="py-5 text-center text-slate-500"
+                                    >
+                                      No confirmed malicious alerts in the
+                                      selected records.
+                                    </td>
+                                  </tr>
+                                )}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                        <p className="text-[11px] text-slate-500">
+                          This report reflects up to the latest 100 alerts
+                          returned by the API, not a complete historical
+                          database export. PDF export is available through
+                          browser Print → Save as PDF.
+                        </p>
+                      </section>
+                    </div>
+                  );
+                })()}
+            </main>
+          </div>
+        );
+      }
+
+      ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+    </script>
+  </body>
+</html>

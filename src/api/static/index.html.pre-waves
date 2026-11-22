@@ -1,0 +1,1221 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SENTINEL — AI Network IDS</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script
+      crossorigin
+      src="https://unpkg.com/react@18/umd/react.production.min.js"
+    ></script>
+    <script
+      crossorigin
+      src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"
+    ></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+      body {
+        background: radial-gradient(
+          circle at 18% 18%,
+          #24194a 0%,
+          #0d1021 42%,
+          #080b16 100%
+        );
+        color: #e2e8f0;
+        font-family:
+          Inter,
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          sans-serif;
+      }
+      .glass-card {
+        background: rgba(17, 22, 43, 0.72);
+        border: 1px solid rgba(129, 140, 248, 0.14);
+        backdrop-filter: blur(14px);
+      }
+      .sidebar-glass {
+        background: linear-gradient(
+          180deg,
+          rgba(35, 24, 74, 0.85) 0%,
+          rgba(13, 17, 36, 0.92) 100%
+        );
+        border-right: 1px solid rgba(129, 140, 248, 0.16);
+      }
+      ::-webkit-scrollbar {
+        width: 6px;
+        height: 6px;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: rgba(148, 163, 184, 0.25);
+        border-radius: 9999px;
+      }
+    </style>
+  </head>
+  <body class="min-h-screen antialiased selection:bg-indigo-500/30">
+    <div id="root"></div>
+
+    <script type="text/babel">
+      const { useState, useEffect, useMemo } = React;
+
+      const PORT_LABELS = {
+        22: "SSH",
+        53: "DNS",
+        80: "HTTP",
+        443: "HTTPS",
+        3389: "RDP",
+        8000: "API",
+        8080: "HTTP-ALT",
+      };
+
+      function formatTime(iso) {
+        if (!iso) return "—";
+        const d = new Date(iso);
+        return d.toLocaleTimeString([], {
+          hour12: false,
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        });
+      }
+
+      function LevelBadge({ level }) {
+        const norm = (level || "benign").toLowerCase();
+        if (norm === "confirmed_malicious" || norm === "malicious") {
+          return (
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-rose-500/15 text-rose-300 border border-rose-500/30">
+              <span className="w-1.5 h-1.5 rounded-full bg-rose-400"></span>{" "}
+              Malicious
+            </span>
+          );
+        }
+        if (norm === "suspicious") {
+          return (
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-amber-500/15 text-amber-300 border border-amber-500/30">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400"></span>{" "}
+              Suspicious
+            </span>
+          );
+        }
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>{" "}
+            Benign
+          </span>
+        );
+      }
+
+      function MiniBars({
+        color = "bg-cyan-400",
+        values = [35, 50, 42, 68, 60, 75, 70, 88, 82, 95, 90, 100],
+      }) {
+        return (
+          <div className="flex items-end gap-1 h-7">
+            {values.map((v, i) => (
+              <div
+                key={i}
+                style={{ height: `${Math.max(18, v)}%` }}
+                className={`w-1 rounded-sm ${color} ${i > 7 ? "opacity-95" : "opacity-55"}`}
+              />
+            ))}
+          </div>
+        );
+      }
+
+      function App() {
+        const [tab, setTab] = useState("overview");
+        const [search, setSearch] = useState("");
+        const [stats, setStats] = useState({
+          total_flows: 0,
+          flows_by_source: {},
+          total_alerts: 0,
+          alerts_by_level: {},
+          alerts_by_class: {},
+        });
+        const [alerts, setAlerts] = useState([]);
+        const [selectedAlertId, setSelectedAlertId] = useState(null);
+        const [alertDetail, setAlertDetail] = useState(null);
+        const [flows, setFlows] = useState([]);
+        const [traffic, setTraffic] = useState({
+          total_sampled: 0,
+          protocols: {},
+          top_talkers: [],
+          top_ports: [],
+        });
+        const [modelInfo, setModelInfo] = useState({
+          active_version: "v1.0.0",
+          schema_name: "features_v1.json",
+          feature_count: 52,
+          detectors: [],
+          features: [],
+        });
+        const [captureStatus, setCaptureStatus] = useState({
+          interface: "wlo1",
+          bpf_filter: "",
+          worker_active: true,
+          live_flows_total: 0,
+        });
+        const [levelFilter, setLevelFilter] = useState("all");
+        const [statusFilter, setStatusFilter] = useState("all");
+        const [latencyMs, setLatencyMs] = useState(12);
+        const [uploadStatus, setUploadStatus] = useState("");
+
+        const fetchDashboardData = async () => {
+          const t0 = performance.now();
+          try {
+            const [sRes, aRes, fRes, tRes, mRes, cRes] = await Promise.all([
+              fetch("/stats"),
+              fetch("/alerts?limit=100"),
+              fetch("/flows?limit=50"),
+              fetch("/traffic/summary?limit_flows=500"),
+              fetch("/models/info"),
+              fetch("/capture/status"),
+            ]);
+            if (sRes.ok) setStats(await sRes.json());
+            if (aRes.ok) {
+              const aData = await aRes.json();
+              const list = aData.alerts || [];
+              setAlerts(list);
+              if (!selectedAlertId && list.length > 0) {
+                setSelectedAlertId(list[0].id);
+              }
+            }
+            if (fRes.ok) {
+              const fData = await fRes.json();
+              setFlows(fData.flows || []);
+            }
+            if (tRes.ok) setTraffic(await tRes.json());
+            if (mRes.ok) setModelInfo(await mRes.json());
+            if (cRes && cRes.ok) setCaptureStatus(await cRes.json());
+            setLatencyMs(Math.max(1, Math.round(performance.now() - t0)));
+          } catch (err) {
+            console.error("Dashboard poll error:", err);
+          }
+        };
+
+        useEffect(() => {
+          fetchDashboardData();
+          const timer = setInterval(fetchDashboardData, 4000);
+          return () => clearInterval(timer);
+        }, []);
+
+        useEffect(() => {
+          if (!selectedAlertId) return;
+          fetch(`/alerts/${selectedAlertId}`)
+            .then((r) => (r.ok ? r.json() : null))
+            .then((d) => setAlertDetail(d))
+            .catch(() => {});
+        }, [selectedAlertId, alerts]);
+
+        const handleUpdateStatus = async (alertId, nextStatus) => {
+          const res = await fetch(
+            `/alerts/${alertId}/status?status=${encodeURIComponent(nextStatus)}`,
+            {
+              method: "PATCH",
+            },
+          );
+          if (res.ok) {
+            await fetchDashboardData();
+          }
+        };
+
+        const handleCsvUpload = async (e) => {
+          const file = e.target.files?.[0];
+          if (!file) return;
+          setUploadStatus("Analyzing flow CSV...");
+          const form = new FormData();
+          form.append("file", file);
+          try {
+            const res = await fetch("/analyze/upload?persist=true", {
+              method: "POST",
+              body: form,
+            });
+            const data = await res.json();
+            if (res.ok) {
+              setUploadStatus(
+                `Analyzed ${data.flows_analyzed} flows • Alerts created: ${data.persistence?.alerts_created ?? 0}`,
+              );
+              fetchDashboardData();
+            } else {
+              setUploadStatus(`Error: ${data.detail || "Upload failed"}`);
+            }
+          } catch (err) {
+            setUploadStatus(`Upload error: ${err.message}`);
+          }
+        };
+
+        const filteredAlerts = useMemo(() => {
+          return alerts.filter((a) => {
+            if (levelFilter !== "all" && a.level !== levelFilter) return false;
+            if (statusFilter !== "all" && a.status !== statusFilter)
+              return false;
+            if (search.trim()) {
+              const q = search.toLowerCase();
+              const matchId =
+                `a-${a.id}`.includes(q) || String(a.id).includes(q);
+              const matchClass = (a.attack_class || "")
+                .toLowerCase()
+                .includes(q);
+              if (!matchId && !matchClass) return false;
+            }
+            return true;
+          });
+        }, [alerts, levelFilter, statusFilter, search]);
+
+        const maliciousCount = stats.alerts_by_level?.confirmed_malicious || 0;
+        const suspiciousCount = stats.alerts_by_level?.suspicious || 0;
+        const openAlertsCount = alerts.filter(
+          (a) => a.status === "open",
+        ).length;
+        const liveFlowsCount = stats.flows_by_source?.live || 0;
+        const offlineFlowsCount = stats.flows_by_source?.offline || 0;
+
+        const parsedEvidence = useMemo(() => {
+          if (!alertDetail?.evidence?.length) return { shap: [], scores: {} };
+          const ev = alertDetail.evidence[0];
+          let shap = ev.shap_values || [];
+          let scores = ev.detector_scores || {};
+          if (typeof shap === "string") {
+            try {
+              shap = JSON.parse(shap);
+            } catch {
+              shap = [];
+            }
+          }
+          if (typeof scores === "string") {
+            try {
+              scores = JSON.parse(scores);
+            } catch {
+              scores = {};
+            }
+          }
+          return { shap, scores };
+        }, [alertDetail]);
+
+        const navItems = [
+          { id: "overview", label: "Overview" },
+          { id: "alerts", label: "Alerts", badge: openAlertsCount },
+          { id: "traffic", label: "Traffic" },
+          { id: "models", label: "Models" },
+          { id: "capture", label: "Capture" },
+        ];
+
+        return (
+          <div className="flex min-h-screen">
+            {/* Left Navigation Sidebar */}
+            <aside className="w-64 shrink-0 sidebar-glass flex flex-col justify-between p-5">
+              <div>
+                <div className="flex items-center gap-3 mb-8 px-1">
+                  <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-cyan-400 to-indigo-500 flex items-center justify-center shadow-lg shadow-cyan-500/20">
+                    <div className="w-4 h-4 rounded-full border-2 border-white"></div>
+                  </div>
+                  <div>
+                    <div className="text-sm font-bold tracking-wider text-white">
+                      SENTINEL
+                    </div>
+                    <div className="text-[11px] text-indigo-300/75">
+                      AI Network IDS
+                    </div>
+                  </div>
+                </div>
+
+                <nav className="space-y-1.5">
+                  {navItems.map((item) => {
+                    const active = tab === item.id;
+                    return (
+                      <button
+                        key={item.id}
+                        onClick={() => setTab(item.id)}
+                        className={`w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-sm font-medium transition ${
+                          active
+                            ? "bg-indigo-500/25 text-white border border-indigo-400/30 shadow-inner"
+                            : "text-slate-300/80 hover:bg-white/5 hover:text-white"
+                        }`}
+                      >
+                        <span>{item.label}</span>
+                        {item.badge > 0 && (
+                          <span className="px-2 py-0.5 text-[11px] font-semibold rounded-full bg-rose-500 text-white">
+                            {item.badge}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </nav>
+              </div>
+
+              {/* Bottom Live Capture Status Card */}
+              <div className="glass-card rounded-xl p-3.5 text-xs">
+                <div className="flex items-center gap-2 font-semibold text-white mb-1">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                  <span>Live capture</span>
+                </div>
+                <div className="text-slate-400 mb-2">
+                  {captureStatus.interface} •{" "}
+                  {captureStatus.worker_active ? "Worker active" : "Standby"}
+                </div>
+                <div className="flex justify-between text-slate-300 py-0.5">
+                  <span className="text-slate-400">Live flows</span>
+                  <span className="font-mono font-semibold text-cyan-300">
+                    {liveFlowsCount}
+                  </span>
+                </div>
+                <div className="flex justify-between text-slate-300 py-0.5">
+                  <span className="text-slate-400">Offline flows</span>
+                  <span className="font-mono text-slate-200">
+                    {offlineFlowsCount}
+                  </span>
+                </div>
+              </div>
+            </aside>
+
+            {/* Main Content Area */}
+            <main className="flex-1 p-7 overflow-y-auto">
+              {/* Top Bar */}
+              <header className="flex flex-wrap items-center justify-between gap-4 mb-6">
+                <div>
+                  <h1 className="text-2xl font-bold text-white capitalize">
+                    {tab}
+                  </h1>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    {tab === "overview" &&
+                      "Real-time threat detection • live & batch telemetry"}
+                    {tab === "alerts" &&
+                      "Triage detections with evidence and SHAP explanations"}
+                    {tab === "traffic" &&
+                      "Protocols, top talkers and destination ports"}
+                    {tab === "models" &&
+                      "Calibrated detector ensemble, schema & version metadata"}
+                    {tab === "capture" &&
+                      "Live worker status & batch CSV flow ingestion"}
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-3">
+                  <input
+                    type="text"
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder="Search IP, class, alert ID..."
+                    className="w-64 px-3.5 py-2 rounded-xl text-xs bg-slate-900/80 border border-indigo-400/20 text-slate-200 placeholder-slate-500 focus:outline-none focus:border-cyan-400/50"
+                  />
+                  <div className="flex items-center gap-2 px-3 py-2 rounded-xl text-xs bg-emerald-500/10 border border-emerald-500/25 text-emerald-300">
+                    <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
+                    <span>Live • {latencyMs}ms API</span>
+                  </div>
+                  <div className="w-10 h-8 rounded-full bg-gradient-to-tr from-indigo-500 to-purple-400 flex items-center justify-center text-xs font-bold text-white">
+                    NIDS
+                  </div>
+                </div>
+              </header>
+
+              {/* OVERVIEW TAB */}
+              {tab === "overview" && (
+                <div className="space-y-6">
+                  {/* 4 KPI Cards */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+                    <div className="glass-card rounded-2xl p-5">
+                      <div className="flex items-center gap-2 text-xs text-slate-300 mb-2">
+                        <span className="w-2 h-2 rounded-full bg-cyan-400"></span>{" "}
+                        Flows analysed
+                      </div>
+                      <div className="flex items-end justify-between">
+                        <div>
+                          <div className="text-3xl font-bold text-white">
+                            {stats.total_flows.toLocaleString()}
+                          </div>
+                          <div className="text-xs text-cyan-400 mt-1">
+                            Live: {liveFlowsCount} • Offline:{" "}
+                            {offlineFlowsCount}
+                          </div>
+                        </div>
+                        <MiniBars color="bg-cyan-400" />
+                      </div>
+                    </div>
+
+                    <div className="glass-card rounded-2xl p-5 border-rose-500/25 bg-rose-950/15">
+                      <div className="flex items-center gap-2 text-xs text-rose-200 mb-2">
+                        <span className="w-2 h-2 rounded-full bg-rose-400"></span>{" "}
+                        Confirmed malicious
+                      </div>
+                      <div className="flex items-end justify-between">
+                        <div>
+                          <div className="text-3xl font-bold text-white">
+                            {maliciousCount.toLocaleString()}
+                          </div>
+                          <div className="text-xs text-rose-300 mt-1">
+                            High-confidence threats
+                          </div>
+                        </div>
+                        <MiniBars
+                          color="bg-rose-400"
+                          values={[
+                            10, 15, 12, 20, 45, 80, 65, 90, 50, 75, 60, 85,
+                          ]}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="glass-card rounded-2xl p-5">
+                      <div className="flex items-center gap-2 text-xs text-amber-200 mb-2">
+                        <span className="w-2 h-2 rounded-full bg-amber-400"></span>{" "}
+                        Suspicious
+                      </div>
+                      <div className="flex items-end justify-between">
+                        <div>
+                          <div className="text-3xl font-bold text-white">
+                            {suspiciousCount.toLocaleString()}
+                          </div>
+                          <div className="text-xs text-amber-300 mt-1">
+                            Queued for analyst review
+                          </div>
+                        </div>
+                        <MiniBars
+                          color="bg-amber-400"
+                          values={[
+                            40, 55, 60, 50, 72, 68, 64, 70, 58, 62, 55, 60,
+                          ]}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="glass-card rounded-2xl p-5">
+                      <div className="flex items-center gap-2 text-xs text-emerald-200 mb-2">
+                        <span className="w-2 h-2 rounded-full bg-emerald-400"></span>{" "}
+                        Open alerts
+                      </div>
+                      <div className="flex items-end justify-between">
+                        <div>
+                          <div className="text-3xl font-bold text-white">
+                            {openAlertsCount}
+                          </div>
+                          <div className="text-xs text-emerald-400 mt-1">
+                            Model {modelInfo.active_version}
+                          </div>
+                        </div>
+                        <MiniBars
+                          color="bg-emerald-400"
+                          values={[
+                            70, 65, 60, 55, 50, 48, 45, 42, 38, 35, 32, 30,
+                          ]}
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Middle Row: Traffic Pulse + Alert Levels */}
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                    <div className="glass-card rounded-2xl p-5 lg:col-span-2">
+                      <div className="flex items-center justify-between mb-4">
+                        <div>
+                          <h2 className="text-sm font-semibold text-white">
+                            Recent captured flows
+                          </h2>
+                          <p className="text-xs text-slate-400">
+                            Latest 5-tuple network sessions ingested into
+                            PostgreSQL
+                          </p>
+                        </div>
+                        <button
+                          onClick={() => setTab("traffic")}
+                          className="text-xs text-cyan-400 hover:underline"
+                        >
+                          Traffic details →
+                        </button>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left text-xs">
+                          <thead>
+                            <tr className="text-slate-400 border-b border-white/10">
+                              <th className="pb-2">ID</th>
+                              <th className="pb-2">SOURCE → DESTINATION</th>
+                              <th className="pb-2">PROTO</th>
+                              <th className="pb-2">INGEST</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-white/5">
+                            {flows.slice(0, 6).map((f) => (
+                              <tr key={f.id} className="hover:bg-white/5">
+                                <td className="py-2 font-mono text-slate-400">
+                                  #{f.id}
+                                </td>
+                                <td className="py-2 font-mono text-slate-200">
+                                  {f.src_ip}:{f.src_port} → {f.dst_ip}:
+                                  {f.dst_port}
+                                </td>
+                                <td className="py-2 text-cyan-300">
+                                  {f.proto}
+                                </td>
+                                <td className="py-2">
+                                  <span
+                                    className={`px-2 py-0.5 rounded text-[11px] ${f.source === "live" ? "bg-cyan-500/15 text-cyan-300" : "bg-slate-700/60 text-slate-300"}`}
+                                  >
+                                    {f.source}
+                                  </span>
+                                </td>
+                              </tr>
+                            ))}
+                            {flows.length === 0 && (
+                              <tr>
+                                <td
+                                  colSpan="4"
+                                  className="py-6 text-center text-slate-500"
+                                >
+                                  No flows recorded yet.
+                                </td>
+                              </tr>
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    <div className="glass-card rounded-2xl p-5 flex flex-col justify-between">
+                      <div>
+                        <h2 className="text-sm font-semibold text-white">
+                          Alert distribution
+                        </h2>
+                        <p className="text-xs text-slate-400 mb-4">
+                          Breakdown across detection tiers
+                        </p>
+                      </div>
+                      <div className="my-auto flex flex-col items-center justify-center py-4">
+                        <div className="w-32 h-32 rounded-full border-[10px] border-amber-400/80 flex flex-col items-center justify-center shadow-lg shadow-amber-500/10">
+                          <div className="text-2xl font-bold text-white">
+                            {stats.total_alerts}
+                          </div>
+                          <div className="text-[11px] text-slate-400">
+                            alerts
+                          </div>
+                        </div>
+                      </div>
+                      <div className="space-y-2 text-xs mt-4">
+                        <div className="flex justify-between">
+                          <span className="text-slate-300 flex items-center gap-2">
+                            <span className="w-2 h-2 rounded-full bg-emerald-400"></span>
+                            Benign flows
+                          </span>
+                          <span className="font-mono text-emerald-300">
+                            {Math.max(
+                              0,
+                              stats.total_flows - stats.total_alerts,
+                            )}
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate-300 flex items-center gap-2">
+                            <span className="w-2 h-2 rounded-full bg-amber-400"></span>
+                            Suspicious
+                          </span>
+                          <span className="font-mono text-amber-300">
+                            {suspiciousCount}
+                          </span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-slate-300 flex items-center gap-2">
+                            <span className="w-2 h-2 rounded-full bg-rose-400"></span>
+                            Confirmed malicious
+                          </span>
+                          <span className="font-mono text-rose-300">
+                            {maliciousCount}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Bottom Row: Recent Alerts + Attack Families */}
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                    <div className="glass-card rounded-2xl p-5 lg:col-span-2">
+                      <div className="flex items-center justify-between mb-4">
+                        <h2 className="text-sm font-semibold text-white">
+                          Recent alerts
+                        </h2>
+                        <button
+                          onClick={() => setTab("alerts")}
+                          className="text-xs text-cyan-400 hover:underline"
+                        >
+                          View all →
+                        </button>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left text-xs">
+                          <thead>
+                            <tr className="text-slate-400 border-b border-white/10">
+                              <th className="pb-2">TIME</th>
+                              <th className="pb-2">ALERT</th>
+                              <th className="pb-2">CLASS</th>
+                              <th className="pb-2">LEVEL</th>
+                              <th className="pb-2">CONF.</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-white/5">
+                            {alerts.slice(0, 5).map((a) => (
+                              <tr
+                                key={a.id}
+                                onClick={() => {
+                                  setSelectedAlertId(a.id);
+                                  setTab("alerts");
+                                }}
+                                className="hover:bg-white/5 cursor-pointer"
+                              >
+                                <td className="py-2.5 font-mono text-slate-400">
+                                  {formatTime(a.created_at)}
+                                </td>
+                                <td className="py-2.5 font-mono text-slate-200">
+                                  A-{a.id} (Flow #{a.flow_id})
+                                </td>
+                                <td className="py-2.5 text-slate-200">
+                                  {a.attack_class}
+                                </td>
+                                <td className="py-2.5">
+                                  <LevelBadge level={a.level} />
+                                </td>
+                                <td className="py-2.5 font-mono text-rose-300">
+                                  {Number(a.confidence).toFixed(2)}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    <div className="glass-card rounded-2xl p-5">
+                      <h2 className="text-sm font-semibold text-white mb-1">
+                        Attack families
+                      </h2>
+                      <p className="text-xs text-slate-400 mb-4">
+                        Confirmed + suspicious breakdown
+                      </p>
+                      <div className="space-y-3.5 text-xs">
+                        {Object.entries(stats.alerts_by_class || {}).map(
+                          ([cls, count]) => {
+                            const pct =
+                              stats.total_alerts > 0
+                                ? Math.round((count / stats.total_alerts) * 100)
+                                : 0;
+                            return (
+                              <div key={cls}>
+                                <div className="flex justify-between mb-1">
+                                  <span className="text-slate-200">{cls}</span>
+                                  <span className="font-mono text-slate-400">
+                                    {count} ({pct}%)
+                                  </span>
+                                </div>
+                                <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                                  <div
+                                    className="h-full bg-gradient-to-r from-rose-500 to-amber-400"
+                                    style={{ width: `${pct}%` }}
+                                  />
+                                </div>
+                              </div>
+                            );
+                          },
+                        )}
+                        {Object.keys(stats.alerts_by_class || {}).length ===
+                          0 && (
+                          <div className="text-slate-500 py-4">
+                            No attack classes recorded yet.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* ALERTS TRIAGE TAB */}
+              {tab === "alerts" && (
+                <div className="space-y-5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {[
+                      { id: "all", label: `All (${alerts.length})` },
+                      {
+                        id: "confirmed_malicious",
+                        label: `Malicious (${maliciousCount})`,
+                      },
+                      {
+                        id: "suspicious",
+                        label: `Suspicious (${suspiciousCount})`,
+                      },
+                    ].map((pill) => (
+                      <button
+                        key={pill.id}
+                        onClick={() => setLevelFilter(pill.id)}
+                        className={`px-3.5 py-1.5 rounded-xl text-xs font-medium border transition ${
+                          levelFilter === pill.id
+                            ? "bg-indigo-500/25 border-indigo-400/40 text-white"
+                            : "bg-slate-900/60 border-white/10 text-slate-400 hover:text-white"
+                        }`}
+                      >
+                        {pill.label}
+                      </button>
+                    ))}
+
+                    <select
+                      value={statusFilter}
+                      onChange={(e) => setStatusFilter(e.target.value)}
+                      className="ml-auto px-3 py-1.5 rounded-xl text-xs bg-slate-900/80 border border-white/10 text-slate-200"
+                    >
+                      <option value="all">Status: All</option>
+                      <option value="open">Status: Open</option>
+                      <option value="acknowledged">Status: Acknowledged</option>
+                      <option value="resolved">Status: Resolved</option>
+                      <option value="false_positive">
+                        Status: False Positive
+                      </option>
+                    </select>
+                  </div>
+
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
+                    {/* Alert List */}
+                    <div className="glass-card rounded-2xl p-5 lg:col-span-2">
+                      <div className="mb-3">
+                        <h2 className="text-sm font-semibold text-white">
+                          All alerts
+                        </h2>
+                        <p className="text-xs text-slate-400">
+                          {filteredAlerts.length} matching results
+                        </p>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left text-xs">
+                          <thead>
+                            <tr className="text-slate-400 border-b border-white/10">
+                              <th className="pb-2">TIME</th>
+                              <th className="pb-2">ALERT / FLOW</th>
+                              <th className="pb-2">CLASS</th>
+                              <th className="pb-2">LEVEL</th>
+                              <th className="pb-2">CONF.</th>
+                              <th className="pb-2">STATUS</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-white/5">
+                            {filteredAlerts.map((a) => {
+                              const selected = a.id === selectedAlertId;
+                              return (
+                                <tr
+                                  key={a.id}
+                                  onClick={() => setSelectedAlertId(a.id)}
+                                  className={`cursor-pointer transition ${
+                                    selected
+                                      ? "bg-cyan-500/15"
+                                      : "hover:bg-white/5"
+                                  }`}
+                                >
+                                  <td className="py-3 font-mono text-slate-400">
+                                    {formatTime(a.created_at)}
+                                  </td>
+                                  <td className="py-3 font-mono text-slate-200">
+                                    A-{a.id} • Flow #{a.flow_id}
+                                  </td>
+                                  <td className="py-3 text-slate-200">
+                                    {a.attack_class}
+                                  </td>
+                                  <td className="py-3">
+                                    <LevelBadge level={a.level} />
+                                  </td>
+                                  <td className="py-3 font-mono text-amber-300">
+                                    {Number(a.confidence).toFixed(2)}
+                                  </td>
+                                  <td className="py-3 capitalize text-slate-300">
+                                    {a.status}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+
+                    {/* Right Inspector Panel (SHAP + Triage) */}
+                    <div className="glass-card rounded-2xl p-5">
+                      {alertDetail ? (
+                        <div className="space-y-4">
+                          <div className="flex items-start justify-between">
+                            <div>
+                              <h3 className="text-lg font-bold text-white">
+                                Alert A-{alertDetail.id}
+                              </h3>
+                              <p className="text-xs text-slate-400">
+                                {alertDetail.created_at}
+                              </p>
+                            </div>
+                            <LevelBadge level={alertDetail.level} />
+                          </div>
+
+                          <div>
+                            <div className="flex justify-between items-end mb-1">
+                              <span className="text-xs text-slate-400">
+                                Calibrated confidence
+                              </span>
+                              <span className="text-xl font-bold text-white">
+                                {Number(alertDetail.confidence).toFixed(2)}
+                              </span>
+                            </div>
+                            <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                              <div
+                                className="h-full bg-gradient-to-r from-cyan-400 via-amber-400 to-rose-500"
+                                style={{
+                                  width: `${Math.min(100, Math.round(Number(alertDetail.confidence) * 100))}%`,
+                                }}
+                              />
+                            </div>
+                          </div>
+
+                          {alertDetail.flow && (
+                            <div className="border-t border-white/10 pt-3 space-y-1.5 text-xs">
+                              <div className="flex justify-between">
+                                <span className="text-slate-400">Source</span>
+                                <span className="font-mono text-slate-200">
+                                  {alertDetail.flow.src_ip}:
+                                  {alertDetail.flow.src_port}
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span className="text-slate-400">
+                                  Destination
+                                </span>
+                                <span className="font-mono text-slate-200">
+                                  {alertDetail.flow.dst_ip}:
+                                  {alertDetail.flow.dst_port}
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span className="text-slate-400">Protocol</span>
+                                <span className="font-mono text-cyan-300">
+                                  {alertDetail.flow.proto}
+                                </span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span className="text-slate-400">
+                                  Capture source
+                                </span>
+                                <span className="font-mono text-slate-200">
+                                  {alertDetail.flow.source}
+                                </span>
+                              </div>
+                            </div>
+                          )}
+
+                          <div className="border-t border-white/10 pt-3">
+                            <div className="text-xs font-semibold text-white mb-2.5">
+                              Why flagged · SHAP
+                            </div>
+                            <div className="space-y-2 text-xs">
+                              {parsedEvidence.shap
+                                .slice(0, 5)
+                                .map((item, idx) => {
+                                  const imp = Number(
+                                    item.importance_score || 0,
+                                  );
+                                  const widthPct = Math.min(
+                                    100,
+                                    Math.max(8, Math.abs(imp) * 35),
+                                  );
+                                  return (
+                                    <div
+                                      key={idx}
+                                      className="flex items-center justify-between gap-2"
+                                    >
+                                      <span
+                                        className="text-slate-300 truncate w-36"
+                                        title={item.feature}
+                                      >
+                                        {item.feature}
+                                      </span>
+                                      <div className="flex-1 h-2 bg-slate-800 rounded-full overflow-hidden">
+                                        <div
+                                          className={`h-full ${imp >= 0 ? "bg-rose-400" : "bg-emerald-400"}`}
+                                          style={{ width: `${widthPct}%` }}
+                                        />
+                                      </div>
+                                      <span className="font-mono text-[11px] text-slate-300 w-12 text-right">
+                                        {imp >= 0
+                                          ? `+${imp.toFixed(2)}`
+                                          : imp.toFixed(2)}
+                                      </span>
+                                    </div>
+                                  );
+                                })}
+                            </div>
+                          </div>
+
+                          <div className="border-t border-white/10 pt-3 space-y-1 text-xs">
+                            <div className="flex justify-between">
+                              <span className="text-slate-400">XGBoost</span>
+                              <span className="font-mono text-slate-200">
+                                {Number(
+                                  parsedEvidence.scores.xgb_binary_prob || 0,
+                                ).toFixed(4)}
+                              </span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span className="text-slate-400">
+                                Random Forest
+                              </span>
+                              <span className="font-mono text-slate-200">
+                                {Number(
+                                  parsedEvidence.scores.rf_binary_prob || 0,
+                                ).toFixed(4)}
+                              </span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span className="text-slate-400">
+                                Isolation Forest
+                              </span>
+                              <span className="font-mono text-slate-200">
+                                {Number(
+                                  parsedEvidence.scores
+                                    .isolation_forest_anomaly_score || 0,
+                                ).toFixed(4)}
+                              </span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span className="text-slate-400">
+                                Model version
+                              </span>
+                              <span className="font-mono text-cyan-300">
+                                {alertDetail.model_version}
+                              </span>
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-2 gap-2 pt-2">
+                            <button
+                              onClick={() =>
+                                handleUpdateStatus(
+                                  alertDetail.id,
+                                  "acknowledged",
+                                )
+                              }
+                              className="py-2 px-3 rounded-xl text-xs font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/30"
+                            >
+                              Acknowledge
+                            </button>
+                            <button
+                              onClick={() =>
+                                handleUpdateStatus(
+                                  alertDetail.id,
+                                  "false_positive",
+                                )
+                              }
+                              className="py-2 px-3 rounded-xl text-xs font-semibold bg-slate-800 text-slate-300 border border-white/10 hover:bg-slate-700"
+                            >
+                              False positive
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="text-xs text-slate-400 py-10 text-center">
+                          Select an alert to inspect SHAP evidence.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* TRAFFIC TAB */}
+              {tab === "traffic" && (
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
+                  <div className="glass-card rounded-2xl p-5">
+                    <h2 className="text-sm font-semibold text-white mb-4">
+                      Protocols
+                    </h2>
+                    <div className="space-y-4 text-xs">
+                      {["TCP", "UDP", "ICMP", "Other"].map((proto) => {
+                        const cnt = traffic.protocols?.[proto] || 0;
+                        const pct =
+                          traffic.total_sampled > 0
+                            ? Math.round((cnt / traffic.total_sampled) * 100)
+                            : 0;
+                        return (
+                          <div key={proto}>
+                            <div className="flex justify-between mb-1">
+                              <span className="text-slate-200 font-medium">
+                                {proto}
+                              </span>
+                              <span className="font-mono text-cyan-300">
+                                {pct}% ({cnt})
+                              </span>
+                            </div>
+                            <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                              <div
+                                className="h-full bg-cyan-400"
+                                style={{ width: `${pct}%` }}
+                              />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="glass-card rounded-2xl p-5">
+                    <h2 className="text-sm font-semibold text-white mb-4">
+                      Top talkers
+                    </h2>
+                    <table className="w-full text-left text-xs">
+                      <thead>
+                        <tr className="text-slate-400 border-b border-white/10">
+                          <th className="pb-2">HOST</th>
+                          <th className="pb-2">FLOWS</th>
+                          <th className="pb-2">MB</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-white/5">
+                        {(traffic.top_talkers || []).map((t) => (
+                          <tr key={t.host}>
+                            <td className="py-2.5 font-mono text-slate-200">
+                              {t.host}
+                            </td>
+                            <td className="py-2.5 font-mono text-cyan-300">
+                              {t.flows}
+                            </td>
+                            <td className="py-2.5 font-mono text-slate-400">
+                              {t.mb}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  <div className="glass-card rounded-2xl p-5">
+                    <h2 className="text-sm font-semibold text-white mb-4">
+                      Top ports
+                    </h2>
+                    <div className="space-y-3.5 text-xs">
+                      {(traffic.top_ports || []).map((p) => {
+                        const pct =
+                          traffic.total_sampled > 0
+                            ? Math.round(
+                                (p.count / traffic.total_sampled) * 100,
+                              )
+                            : 0;
+                        return (
+                          <div key={p.port}>
+                            <div className="flex justify-between mb-1">
+                              <span className="font-mono text-slate-200">
+                                {p.port} • {PORT_LABELS[p.port] || "SVC"}
+                              </span>
+                              <span className="font-mono text-cyan-300">
+                                {pct}%
+                              </span>
+                            </div>
+                            <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
+                              <div
+                                className="h-full bg-indigo-400"
+                                style={{ width: `${pct}%` }}
+                              />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* MODELS TAB */}
+              {tab === "models" && (
+                <div className="space-y-5">
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div className="glass-card rounded-2xl p-5">
+                      <div className="text-xs text-slate-400 mb-1">
+                        Active Artifact Version
+                      </div>
+                      <div className="text-2xl font-bold text-white">
+                        {modelInfo.active_version}
+                      </div>
+                      <div className="text-xs text-emerald-400 mt-1">
+                        Platt-calibrated 1D probabilities
+                      </div>
+                    </div>
+                    <div className="glass-card rounded-2xl p-5">
+                      <div className="text-xs text-slate-400 mb-1">
+                        Feature Schema
+                      </div>
+                      <div className="text-2xl font-bold text-white">
+                        {modelInfo.schema_name}
+                      </div>
+                      <div className="text-xs text-cyan-400 mt-1">
+                        {modelInfo.feature_count} aligned flow features
+                      </div>
+                    </div>
+                    <div className="glass-card rounded-2xl p-5">
+                      <div className="text-xs text-slate-400 mb-1">
+                        Explainability
+                      </div>
+                      <div className="text-2xl font-bold text-white">
+                        SHAP + Ensemble
+                      </div>
+                      <div className="text-xs text-indigo-300 mt-1">
+                        Top-5 per-alert evidence persisted
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="glass-card rounded-2xl p-5">
+                    <h2 className="text-sm font-semibold text-white mb-3">
+                      Ensemble Detectors
+                    </h2>
+                    <div className="divide-y divide-white/5 text-xs">
+                      {(modelInfo.detectors || []).map((d) => (
+                        <div
+                          key={d.name}
+                          className="py-3 flex items-center justify-between"
+                        >
+                          <div>
+                            <div className="font-semibold text-slate-200">
+                              {d.name}
+                            </div>
+                            <div className="text-slate-400">{d.role}</div>
+                          </div>
+                          <span className="px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                            Active
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* CAPTURE & UPLOAD TAB */}
+              {tab === "capture" && (
+                <div className="glass-card rounded-2xl p-6 max-w-2xl space-y-4">
+                  <h2 className="text-base font-semibold text-white">
+                    Batch Flow CSV Ingestion
+                  </h2>
+                  <p className="text-xs text-slate-400">
+                    Upload a CIC-IDS2017 / flow-feature CSV directly to{" "}
+                    <code className="text-cyan-300">POST /analyze/upload</code>{" "}
+                    to score flows and persist detections to PostgreSQL.
+                  </p>
+                  <input
+                    type="file"
+                    accept=".csv"
+                    onChange={handleCsvUpload}
+                    className="block w-full text-xs text-slate-300 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-indigo-500/25 file:text-indigo-200 hover:file:bg-indigo-500/35"
+                  />
+                  {uploadStatus && (
+                    <div className="text-xs text-cyan-300 font-mono">
+                      {uploadStatus}
+                    </div>
+                  )}
+                </div>
+              )}
+            </main>
+          </div>
+        );
+      }
+
+      ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+    </script>
+  </body>
+</html>

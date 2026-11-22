@@ -1,0 +1,478 @@
+import argparse
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+import threading
+import uuid
+from typing import Any, Dict, List, Optional
+from urllib import error, request
+
+import pandas as pd
+
+from src.decision.engine import NIDSDetectionEngine
+from src.features.flow_builder import FlowAccumulator, load_schema_features
+
+
+def _extract_packet_fields(pkt: Any) -> Optional[Dict[str, Any]]:
+    """Extract normalized L3/L4 packet metadata and TCP flags from a Scapy packet."""
+    if not pkt.haslayer("IP"):
+        return None
+
+    ip_layer = pkt["IP"]
+    src_ip = str(ip_layer.src)
+    dst_ip = str(ip_layer.dst)
+    proto_num = int(ip_layer.proto)
+    ts = float(getattr(pkt, "time", time.time()))
+    pkt_len = int(len(pkt))
+    ip_ihl = int(getattr(ip_layer, "ihl", 5) or 5) * 4
+
+    src_port = 0
+    dst_port = 0
+    proto = str(proto_num)
+    header_len = ip_ihl
+    flags: Dict[str, int] = {}
+
+    if pkt.haslayer("TCP"):
+        tcp_layer = pkt["TCP"]
+        proto = "TCP"
+        src_port = int(tcp_layer.sport)
+        dst_port = int(tcp_layer.dport)
+        data_ofs = int(getattr(tcp_layer, "dataofs", 5) or 5) * 4
+        header_len = ip_ihl + data_ofs
+        raw_flags = str(tcp_layer.flags)
+        flags = {
+            "fin": int("F" in raw_flags),
+            "syn": int("S" in raw_flags),
+            "rst": int("R" in raw_flags),
+            "psh": int("P" in raw_flags),
+            "ack": int("A" in raw_flags),
+            "urg": int("U" in raw_flags),
+            "cwe": int("C" in raw_flags),
+            "ece": int("E" in raw_flags),
+        }
+    elif pkt.haslayer("UDP"):
+        udp_layer = pkt["UDP"]
+        proto = "UDP"
+        src_port = int(udp_layer.sport)
+        dst_port = int(udp_layer.dport)
+        header_len = ip_ihl + 8
+    elif pkt.haslayer("ICMP"):
+        proto = "ICMP"
+
+    return {
+        "ts": ts,
+        "src_ip": src_ip,
+        "dst_ip": dst_ip,
+        "src_port": src_port,
+        "dst_port": dst_port,
+        "proto": proto,
+        "pkt_len": pkt_len,
+        "header_len": header_len,
+        "flags": flags,
+    }
+
+
+def _post_flows_to_api(api_url: str, flows: List[dict], source: str = "live", timeout_s: float = 10.0) -> bool:
+    """Send completed flow records to the API ingestion endpoint if available."""
+    endpoint = f"{api_url.rstrip('/')}/analyze/flows"
+    payload = json.dumps(
+        {
+            "source": source,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "flows": flows,
+        }
+    ).encode("utf-8")
+
+    req = request.Request(
+        endpoint,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=timeout_s) as resp:
+            return 200 <= resp.status < 300
+    except error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        print(f"[warn] POST {endpoint} returned {exc.code}: {body[:240]}", file=sys.stderr)
+        return False
+    except Exception as exc:
+        print(f"[warn] POST {endpoint} failed: {exc}", file=sys.stderr)
+        return False
+
+
+def _post_capture_telemetry(api_url: str, payload: Dict[str, Any]) -> bool:
+    """Send capture-worker heartbeat directly to the API."""
+    endpoint = f"{api_url.rstrip('/')}/capture/telemetry"
+    body = json.dumps(payload).encode("utf-8")
+    req = request.Request(
+        endpoint,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=2.0) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        # The local telemetry file remains available as a fallback.
+        return False
+
+
+def _score_flows_locally(engine: NIDSDetectionEngine, flows: List[dict]) -> List[Dict[str, Any]]:
+    """Score completed flow dicts using NIDSDetectionEngine."""
+    if not flows:
+        return []
+    rows = []
+    for f in flows:
+        row = dict(f["features"])
+        row["src_ip"] = f["src_ip"]
+        row["dst_ip"] = f["dst_ip"]
+        row["src_port"] = f["src_port"]
+        row["dst_port"] = f["dst_port"]
+        row["proto"] = f["proto"]
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    return engine.predict_dataframe(df)
+
+
+class LiveCaptureWorker:
+    """Captures live or PCAP packets, aggregates flows, and emits detection decisions."""
+
+    def __init__(
+        self,
+        interface: Optional[str] = None,
+        bpf_filter: Optional[str] = None,
+        idle_timeout_s: float = 10.0,
+        active_timeout_s: float = 60.0,
+        flush_interval_s: float = 5.0,
+        batch_size: int = 25,
+        api_url: Optional[str] = None,
+        direct_engine: bool = False,
+        artifacts_dir: Path = Path("artifacts/models/v2"),
+    ):
+        self.interface = interface
+        self.bpf_filter = bpf_filter
+        self.flush_interval_s = flush_interval_s
+        self.batch_size = batch_size
+        self.api_url = api_url
+        self.direct_engine = direct_engine or (api_url is None)
+        self.accumulator = FlowAccumulator(
+            idle_timeout_s=idle_timeout_s,
+            active_timeout_s=active_timeout_s,
+        )
+        self.engine = NIDSDetectionEngine(artifacts_dir=artifacts_dir) if self.direct_engine else None
+        self._pending_flows: List[dict] = []
+        self._last_flush = time.monotonic()
+        self._stop_requested = False
+        self._pcap_mode = False
+        self._next_retry_at = 0.0
+        self._retry_delay_s = 2.0
+
+        self.session_id = str(uuid.uuid4())
+        self.started_at = time.time()
+        self.packets_total = 0
+        self.flows_completed_total = 0
+        self.flows_delivered_total = 0
+        self.delivery_failures_total = 0
+        self.flows_abandoned_total = 0
+        self._last_metrics_write = 0.0
+        self._last_rate_time = time.monotonic()
+        self._last_packet_count = 0
+        self._last_flow_count = 0
+        self.packet_rate = 0.0
+        self.flow_rate = 0.0
+        self.metrics_path = Path(
+            os.getenv(
+                "NIDS_TELEMETRY_FILE",
+                "/run/nids-capture/telemetry.json",
+            )
+        )
+        self.write_telemetry(force=True)
+        self._telemetry_thread = threading.Thread(
+            target=self._telemetry_loop,
+            name="nids-telemetry",
+            daemon=True,
+        )
+        self._telemetry_thread.start()
+
+    def _telemetry_loop(self):
+        while not self._stop_requested:
+            self.write_telemetry(force=True)
+            time.sleep(1.0)
+        self.write_telemetry(force=True)
+
+    def request_stop(self, *_args):
+        self._stop_requested = True
+        self.write_telemetry(force=True)
+
+    def write_telemetry(self, force=False):
+        now_mono = time.monotonic()
+        if not force and now_mono - self._last_metrics_write < 1.0:
+            return
+
+        elapsed = max(now_mono - self._last_rate_time, 0.001)
+        self.packet_rate = (self.packets_total - self._last_packet_count) / elapsed
+        self.flow_rate = (self.flows_completed_total - self._last_flow_count) / elapsed
+
+        self._last_packet_count = self.packets_total
+        self._last_flow_count = self.flows_completed_total
+        self._last_rate_time = now_mono
+        self._last_metrics_write = now_mono
+
+        payload = {
+            "session_id": self.session_id,
+            "status": "stopping" if self._stop_requested else "running",
+            "interface": self.interface,
+            "bpf_filter": self.bpf_filter,
+            "started_at": self.started_at,
+            "uptime_seconds": max(0, time.time() - self.started_at),
+            "packets_total": self.packets_total,
+            "packets_per_sec": round(self.packet_rate, 2),
+            "flows_completed_total": self.flows_completed_total,
+            "flows_per_sec": round(self.flow_rate, 2),
+            "flows_delivered_total": self.flows_delivered_total,
+            "pending_flows": len(self._pending_flows),
+            "delivery_failures_total": self.delivery_failures_total,
+            "flows_abandoned_total": self.flows_abandoned_total,
+            "updated_at": time.time(),
+        }
+
+        try:
+            self.metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.metrics_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(payload))
+            os.replace(temporary, self.metrics_path)
+        except Exception as exc:
+            print(f"[warn] Could not write capture telemetry: {exc}", file=sys.stderr)
+
+        # Prefer direct API heartbeat; file telemetry remains a fallback.
+        if self.api_url:
+            _post_capture_telemetry(self.api_url, payload)
+
+    def _emit_batch(self, flows: List[dict]) -> bool:
+        """Deliver a batch; return True only when its configured sink succeeds."""
+        if not flows:
+            return True
+
+        if self.api_url:
+            sent_to_api = _post_flows_to_api(self.api_url, flows, source="live")
+            print(f"[api] batch_size={len(flows)} sent_ok={sent_to_api}")
+
+            if sent_to_api:
+                return True
+
+            self.delivery_failures_total += len(flows)
+            self.write_telemetry(force=True)
+
+            # Local scoring is diagnostic only when API persistence was requested.
+            if self.direct_engine and self.engine is not None:
+                self._score_batch_locally(flows)
+
+            return False
+
+        if self.direct_engine and self.engine is not None:
+            self._score_batch_locally(flows)
+            return True
+
+        print("[warn] No API or local inference sink configured; batch not delivered.")
+        return False
+
+    def _score_batch_locally(self, flows: List[dict]) -> None:
+        decisions = _score_flows_locally(self.engine, flows)
+        for flow, dec in zip(flows, decisions):
+            if dec["level"] != "benign":
+                print(
+                    f"[{dec['level'].upper()}] {dec['attack_class']} "
+                    f"(conf={dec['confidence']:.4f}, anom={dec['anomaly_score']:.4f}) "
+                    f"{flow['src_ip']}:{flow['src_port']} -> {flow['dst_ip']}:{flow['dst_port']} ({flow['proto']})"
+                )
+            else:
+                print(
+                    f"[BENIGN] {flow['src_ip']}:{flow['src_port']} -> {flow['dst_ip']}:{flow['dst_port']} "
+                    f"({flow['proto']}, conf={dec['confidence']:.4f})"
+                )
+
+    def _emit_pending_batch(self, force: bool = False) -> bool:
+        """Attempt the next pending batch without dropping it on failure."""
+        if not self._pending_flows:
+            return True
+
+        if not force and time.monotonic() < self._next_retry_at:
+            return False
+
+        batch = self._pending_flows[:self.batch_size]
+
+        if self._emit_batch(batch):
+            del self._pending_flows[:len(batch)]
+            self.flows_delivered_total += len(batch)
+            self._next_retry_at = 0.0
+            self.write_telemetry(force=True)
+            return True
+
+        self._next_retry_at = time.monotonic() + self._retry_delay_s
+        print(
+            f"[warn] Retaining {len(self._pending_flows)} pending flow(s); "
+            f"next retry in {self._retry_delay_s:.1f}s."
+        )
+        return False
+
+    def handle_packet(self, pkt: Any) -> None:
+        parsed = _extract_packet_fields(pkt)
+        if parsed is None:
+            return
+
+        self.packets_total += 1
+        completed = self.accumulator.add_packet(**parsed)
+        if completed:
+            self.flows_completed_total += len(completed)
+            self._pending_flows.extend(completed)
+
+        now = time.monotonic()
+        if (
+            not self._pcap_mode
+            and (now - self._last_flush) >= self.flush_interval_s
+        ):
+            expired = self.accumulator.flush_expired(
+                now_ts=time.time(),
+                flush_all=False,
+            )
+            if expired:
+                self._pending_flows.extend(expired)
+            self._last_flush = now
+
+        if len(self._pending_flows) >= self.batch_size:
+            self._emit_pending_batch()
+
+        self.write_telemetry()
+
+    def flush_remaining(self) -> None:
+        leftover = self.accumulator.flush_expired(flush_all=True)
+        if leftover:
+            self._pending_flows.extend(leftover)
+
+        while self._pending_flows:
+            if not self._emit_pending_batch(force=True):
+                break
+
+        if self._pending_flows:
+            self.flows_abandoned_total += len(self._pending_flows)
+            print(
+                f"[error] Capture stopped with {len(self._pending_flows)} "
+                "undelivered flow(s) still in memory."
+            )
+        self.write_telemetry(force=True)
+
+    def run_pcap(self, pcap_path: Path) -> None:
+        from scapy.all import PcapReader
+
+        self._pcap_mode = True
+
+        with PcapReader(str(pcap_path)) as reader:
+            for pkt in reader:
+                if self._stop_requested:
+                    break
+                self.handle_packet(pkt)
+        self.flush_remaining()
+
+    def run_live(self, packet_count: int = 0, timeout_s: Optional[float] = None) -> None:
+        from scapy.all import sniff
+
+        self._pcap_mode = False
+
+        signal.signal(signal.SIGINT, self.request_stop)
+        signal.signal(signal.SIGTERM, self.request_stop)
+
+        print(
+            f"Starting live capture on interface={self.interface or 'default'} "
+            f"filter={self.bpf_filter or 'all'} direct_engine={self.direct_engine} api_url={self.api_url or 'none'}"
+        )
+        sniff(
+            iface=self.interface,
+            filter=self.bpf_filter,
+            prn=self.handle_packet,
+            store=False,
+            count=packet_count if packet_count > 0 else 0,
+            timeout=timeout_s,
+            stop_filter=lambda _pkt: self._stop_requested,
+        )
+        self.flush_remaining()
+
+
+def _run_synthetic_smoke() -> None:
+    """Feed synthetic packets into LiveCaptureWorker without root or a PCAP file."""
+    worker = LiveCaptureWorker(idle_timeout_s=1.0, active_timeout_s=10.0, batch_size=10, direct_engine=True)
+    base_ts = 1763714400.0
+    for i in range(6):
+        pkt_dict = {
+            "ts": base_ts + i * 0.05,
+            "src_ip": "192.168.1.50",
+            "dst_ip": "192.168.1.10",
+            "src_port": 54321,
+            "dst_port": 80,
+            "proto": "TCP",
+            "pkt_len": 128,
+            "header_len": 40,
+            "flags": {"syn": 1 if i == 0 else 0, "ack": 1 if i > 0 else 0, "psh": 1},
+        }
+        completed = worker.accumulator.add_packet(**pkt_dict)
+        if completed:
+            worker._pending_flows.extend(completed)
+    worker.flush_remaining()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Live Scapy packet capture & flow ingestion worker")
+    parser.add_argument("--iface", default=os.getenv("NIDS_CAPTURE_IFACE"), help="Network interface (e.g. eth0, lo)")
+    parser.add_argument("--bpf", default=os.getenv("NIDS_BPF_FILTER"), help="Optional BPF capture filter")
+    parser.add_argument("--pcap", type=Path, help="Replay an existing .pcap file instead of live sniffing")
+    parser.add_argument("--idle-timeout", type=float, default=10.0, help="Flow idle timeout in seconds")
+    parser.add_argument("--active-timeout", type=float, default=60.0, help="Max flow lifetime in seconds")
+    parser.add_argument("--flush-interval", type=float, default=5.0, help="Periodic expiration check in seconds")
+    parser.add_argument("--batch-size", type=int, default=25, help="Flows per emit batch")
+    parser.add_argument("--count", type=int, default=0, help="Max live packets to capture (0 = unlimited)")
+    parser.add_argument("--timeout", type=float, default=None, help="Optional live capture duration in seconds")
+    parser.add_argument("--api-url", default=os.getenv("NIDS_API_URL"), help="FastAPI base URL (e.g. http://localhost:8000)")
+    parser.add_argument("--direct", action="store_true", help="Score flows locally with NIDSDetectionEngine")
+    parser.add_argument(
+        "--artifacts-dir",
+        type=Path,
+        default=Path(os.getenv("NIDS_ARTIFACTS_DIR", "artifacts/models/v2")),
+        help="Path to calibrated model artifacts",
+    )
+    parser.add_argument("--smoke-test", action="store_true", help="Run synthetic flow smoke test and exit")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    _ = load_schema_features()
+
+    if args.smoke_test:
+        _run_synthetic_smoke()
+        return
+
+    worker = LiveCaptureWorker(
+        interface=args.iface,
+        bpf_filter=args.bpf,
+        idle_timeout_s=args.idle_timeout,
+        active_timeout_s=args.active_timeout,
+        flush_interval_s=args.flush_interval,
+        batch_size=args.batch_size,
+        api_url=args.api_url,
+        direct_engine=args.direct,
+        artifacts_dir=args.artifacts_dir,
+    )
+
+    if args.pcap:
+        worker.run_pcap(args.pcap)
+    else:
+        worker.run_live(packet_count=args.count, timeout_s=args.timeout)
+
+
+if __name__ == "__main__":
+    main()

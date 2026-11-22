@@ -1,0 +1,942 @@
+from datetime import datetime, timezone
+from io import StringIO
+import json
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+
+
+class FlowItem(BaseModel):
+    src_ip: str = "0.0.0.0"
+    dst_ip: str = "0.0.0.0"
+    src_port: int = 0
+    dst_port: int = 0
+    proto: str = "TCP"
+    features: Dict[str, float] = Field(default_factory=dict)
+
+
+class FlowBatchRequest(BaseModel):
+    source: str = "live"
+    captured_at: Optional[str] = None
+    flows: List[FlowItem] = Field(default_factory=list)
+from fastapi.middleware.cors import CORSMiddleware
+import pandas as pd
+import numpy as np
+from sqlalchemy import desc, select
+from sqlalchemy.orm import Session
+
+from src.db.database import Base, SessionLocal, engine
+import src.db.models  # noqa: F401
+from src.decision.engine import NIDSDetectionEngine
+
+app = FastAPI(title="NIDS Inference & Alerting API", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+_engine_instance: Optional[NIDSDetectionEngine] = None
+
+_DRIFT_REFERENCE = None
+_DRIFT_HISTORY = []
+_DRIFT_LAST_FLOW_ID = None
+
+RAW_COL_RENAME = {
+    "flow duration": "flow_duration",
+    "total fwd packets": "total_fwd_packets",
+    "total backward packets": "total_bwd_packets",
+    "total length of fwd packets": "total_length_fwd_packets",
+    "total length of bwd packets": "total_length_bwd_packets",
+    "fwd packet length max": "fwd_packet_length_max",
+    "fwd packet length min": "fwd_packet_length_min",
+    "fwd packet length mean": "fwd_packet_length_mean",
+    "bwd packet length max": "bwd_packet_length_max",
+    "bwd packet length min": "bwd_packet_length_min",
+    "bwd packet length mean": "bwd_packet_length_mean",
+    "flow bytes/s": "flow_bytes_per_sec",
+    "flow packets/s": "flow_packets_per_sec",
+    "flow iat mean": "flow_iat_mean",
+    "flow iat std": "flow_iat_std",
+    "flow iat max": "flow_iat_max",
+    "flow iat min": "flow_iat_min",
+    "fwd iat total": "fwd_iat_total",
+    "fwd iat mean": "fwd_iat_mean",
+    "fwd iat std": "fwd_iat_std",
+    "fwd iat max": "fwd_iat_max",
+    "fwd iat min": "fwd_iat_min",
+    "bwd iat total": "bwd_iat_total",
+    "bwd iat mean": "bwd_iat_mean",
+    "bwd iat std": "bwd_iat_std",
+    "bwd iat max": "bwd_iat_max",
+    "bwd iat min": "bwd_iat_min",
+    "fwd psh flags": "fwd_psh_flags",
+    "bwd psh flags": "bwd_psh_flags",
+    "fwd urg flags": "fwd_urg_flags",
+    "bwd urg flags": "bwd_urg_flags",
+    "fwd header length": "fwd_header_length",
+    "bwd header length": "bwd_header_length",
+    "fwd packets/s": "fwd_packets_per_sec",
+    "bwd packets/s": "bwd_packets_per_sec",
+    "min packet length": "packet_length_min",
+    "max packet length": "packet_length_max",
+    "packet length mean": "packet_length_mean",
+    "packet length std": "packet_length_std",
+    "packet length variance": "packet_length_variance",
+    "fin flag count": "fin_flag_count",
+    "syn flag count": "syn_flag_count",
+    "rst flag count": "rst_flag_count",
+    "psh flag count": "psh_flag_count",
+    "ack flag count": "ack_flag_count",
+    "urg flag count": "urg_flag_count",
+    "cwe flag count": "cwe_flag_count",
+    "ece flag count": "ece_flag_count",
+    "down/up ratio": "down_up_ratio",
+    "average packet size": "avg_packet_size",
+    "avg fwd segment size": "avg_fwd_segment_size",
+    "avg bwd segment size": "avg_bwd_segment_size",
+}
+
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def get_detector() -> NIDSDetectionEngine:
+    global _engine_instance
+    if _engine_instance is None:
+        art_dir = Path(os.getenv("NIDS_ARTIFACTS_DIR", "artifacts/models/v3"))
+        _engine_instance = NIDSDetectionEngine(artifacts_dir=art_dir)
+    return _engine_instance
+
+
+def _build_row_for_table(table_name: str, candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    table = Base.metadata.tables.get(table_name)
+    if table is None:
+        return None
+    row: Dict[str, Any] = {}
+    for col in table.columns:
+        if col.primary_key and col.autoincrement:
+            continue
+        if col.name in candidate:
+            row[col.name] = candidate[col.name]
+    return row
+
+
+def _persist_decisions(
+    db: Session,
+    df: pd.DataFrame,
+    decisions: List[Dict[str, Any]],
+    source_name: str,
+) -> Dict[str, int]:
+    now = datetime.now(timezone.utc)
+    flows_table = Base.metadata.tables.get("flows")
+    alerts_table = Base.metadata.tables.get("alerts")
+    evidence_table = Base.metadata.tables.get("alert_evidence")
+    audit_table = Base.metadata.tables.get("audit_log")
+
+    inserted_flows = 0
+    inserted_alerts = 0
+    inserted_evidence = 0
+    schema_cols = get_detector().features
+
+    for idx, dec in enumerate(decisions):
+        src_row = df.iloc[idx]
+        src_ip = str(src_row.get("src_ip", src_row.get("source_ip", "0.0.0.0")))
+        dst_ip = str(src_row.get("dst_ip", src_row.get("destination_ip", "0.0.0.0")))
+        src_port = int(pd.to_numeric(src_row.get("src_port", src_row.get("source_port", 0)), errors="coerce") or 0)
+        dst_port = int(pd.to_numeric(src_row.get("dst_port", src_row.get("destination_port", 0)), errors="coerce") or 0)
+        proto = str(src_row.get("proto", src_row.get("protocol", "TCP")))
+
+        feat_dict = {
+            k: float(pd.to_numeric(src_row.get(k, 0.0), errors="coerce") or 0.0)
+            for k in schema_cols
+        }
+        feat_val = feat_dict if True else json.dumps(feat_dict)
+
+        flow_id = None
+        if flows_table is not None:
+            flow_payload = _build_row_for_table(
+                "flows",
+                {
+                    "ts": now,
+                    "src_ip": src_ip,
+                    "dst_ip": dst_ip,
+                    "src_port": src_port,
+                    "dst_port": dst_port,
+                    "proto": proto,
+                    "feature_vector": feat_val,
+                    "source": source_name,
+                },
+            )
+            if flow_payload:
+                res = db.execute(flows_table.insert().values(**flow_payload).returning(flows_table.c.id))
+                flow_id = res.scalar_one_or_none()
+                inserted_flows += 1
+
+        if dec["level"] in {"suspicious", "confirmed_malicious"} and alerts_table is not None:
+            alert_payload = _build_row_for_table(
+                "alerts",
+                {
+                    "flow_id": flow_id,
+                    "level": dec["level"],
+                    "attack_class": dec["attack_class"],
+                    "confidence": float(dec["confidence"]),
+                    "anomaly_score": float(dec["anomaly_score"]),
+                    "model_version": dec["model_version"],
+                    "status": "open",
+                    "created_at": now,
+                },
+            )
+            if alert_payload:
+                ares = db.execute(alerts_table.insert().values(**alert_payload).returning(alerts_table.c.id))
+                alert_id = ares.scalar_one_or_none()
+                inserted_alerts += 1
+
+                if evidence_table is not None and alert_id is not None:
+                    shap_val = dec.get("shap_values", []) if True else json.dumps(dec.get("shap_values", []))
+                    det_val = dec.get("detector_scores", {}) if True else json.dumps(dec.get("detector_scores", {}))
+                    ev_payload = _build_row_for_table(
+                        "alert_evidence",
+                        {
+                            "alert_id": alert_id,
+                            "shap_values": shap_val,
+                            "detector_scores": det_val,
+                            "notes": f"Source file: {source_name}",
+                        },
+                    )
+                    if ev_payload:
+                        db.execute(evidence_table.insert().values(**ev_payload))
+                        inserted_evidence += 1
+
+    if audit_table is not None:
+        audit_payload = _build_row_for_table(
+            "audit_log",
+            {
+                "action": "analyze_upload",
+                "target": source_name,
+                "details": json.dumps(
+                    {
+                        "rows_analyzed": len(decisions),
+                        "alerts_created": inserted_alerts,
+                    }
+                ),
+                "created_at": now,
+            },
+        )
+        if audit_payload:
+            db.execute(audit_table.insert().values(**audit_payload))
+
+    db.commit()
+    return {
+        "flows_persisted": inserted_flows,
+        "alerts_created": inserted_alerts,
+        "evidence_records_created": inserted_evidence,
+    }
+
+
+@app.on_event("startup")
+def on_startup():
+    Base.metadata.create_all(bind=engine)
+    get_detector()
+
+
+@app.get("/health")
+def health(db: Session = Depends(get_db)):
+    db.execute(select(1))
+    detector = get_detector()
+    return {
+        "status": "ok",
+        "database": "connected",
+        "model_version": detector.model_version,
+        "malicious_threshold": detector.malicious_threshold,
+        "suspicious_threshold": detector.suspicious_threshold,
+    }
+
+
+@app.post("/analyze/upload")
+async def analyze_upload(
+    file: UploadFile = File(...),
+    max_rows: int = Query(default=1000, ge=1, le=50000),
+    persist: bool = Query(default=True),
+    db: Session = Depends(get_db),
+):
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Please upload a .csv file.")
+
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded CSV file is empty.")
+
+    try:
+        text = raw_bytes.decode("utf-8", errors="replace")
+        df = pd.read_csv(StringIO(text), low_memory=False)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to parse CSV: {exc}") from exc
+
+    if df.empty:
+        raise HTTPException(status_code=400, detail="CSV contains zero rows.")
+
+    df = df.head(max_rows).copy()
+    df.columns = [str(c).strip().lower().replace(" ", "_") if str(c).strip().lower() not in RAW_COL_RENAME else RAW_COL_RENAME[str(c).strip().lower()] for c in df.columns]
+
+    detector = get_detector()
+    decisions = detector.predict_dataframe(df)
+
+    persisted_stats = {"flows_persisted": 0, "alerts_created": 0, "evidence_records_created": 0}
+    if persist:
+        persisted_stats = _persist_decisions(db, df, decisions, source_name=file.filename)
+
+    tier_counts = {"benign": 0, "suspicious": 0, "confirmed_malicious": 0}
+    for d in decisions:
+        tier_counts[d["level"]] = tier_counts.get(d["level"], 0) + 1
+
+    return {
+        "filename": file.filename,
+        "rows_analyzed": len(decisions),
+        "tier_counts": tier_counts,
+        "persistence": persisted_stats,
+        "results": decisions[:100],
+    }
+
+
+
+
+@app.post("/analyze/flows")
+def analyze_flows(
+    payload: FlowBatchRequest,
+    persist: bool = Query(default=True),
+    db: Session = Depends(get_db),
+):
+    if not payload.flows:
+        raise HTTPException(status_code=400, detail="Request contains zero flows.")
+
+    rows = []
+    for item in payload.flows:
+        row = dict(item.features)
+        row["src_ip"] = item.src_ip
+        row["dst_ip"] = item.dst_ip
+        row["src_port"] = item.src_port
+        row["dst_port"] = item.dst_port
+        row["proto"] = item.proto
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    detector = get_detector()
+    decisions = detector.predict_dataframe(df)
+
+    persisted_stats = {"flows_persisted": 0, "alerts_created": 0, "evidence_records_created": 0}
+    if persist:
+        persisted_stats = _persist_decisions(db, df, decisions, source_name=payload.source or "live")
+
+    tier_counts = {"benign": 0, "suspicious": 0, "confirmed_malicious": 0}
+    for d in decisions:
+        tier_counts[d["level"]] = tier_counts.get(d["level"], 0) + 1
+
+    return {
+        "source": payload.source or "live",
+        "flows_analyzed": len(decisions),
+        "tier_counts": tier_counts,
+        "persistence": persisted_stats,
+        "results": decisions[:100],
+    }
+
+
+@app.get("/alerts")
+def list_alerts(
+    level: Optional[str] = Query(default=None, description="Filter by benign, suspicious, or confirmed_malicious"),
+    attack_class: Optional[str] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    alerts_table = Base.metadata.tables.get("alerts")
+    if alerts_table is None:
+        return {"count": 0, "alerts": []}
+
+    stmt = select(alerts_table)
+    if level and "level" in alerts_table.c:
+        stmt = stmt.where(alerts_table.c.level == level)
+    elif level and "severity" in alerts_table.c:
+        stmt = stmt.where(alerts_table.c.severity == level)
+
+    if attack_class and "attack_class" in alerts_table.c:
+        stmt = stmt.where(alerts_table.c.attack_class == attack_class)
+
+    order_col = alerts_table.c.id if "id" in alerts_table.c else list(alerts_table.columns)[0]
+    stmt = stmt.order_by(desc(order_col)).limit(limit)
+
+    rows = db.execute(stmt).mappings().all()
+    serialized = []
+    for r in rows:
+        item = {}
+        for k, v in r.items():
+            if isinstance(v, datetime):
+                item[k] = v.isoformat()
+            elif isinstance(v, str) and v.startswith(("{", "[")):
+                try:
+                    item[k] = json.loads(v)
+                except Exception:
+                    item[k] = v
+            else:
+                item[k] = v
+        serialized.append(item)
+
+    return {"count": len(serialized), "alerts": serialized}
+
+
+@app.get("/stats")
+def get_stats(db: Session = Depends(get_db)):
+    flows_table = Base.metadata.tables.get("flows")
+    alerts_table = Base.metadata.tables.get("alerts")
+
+    total_flows = 0
+    flows_by_source: Dict[str, int] = {}
+    if flows_table is not None:
+        rows = db.execute(flows_table.select()).mappings().all()
+        total_flows = len(rows)
+        for r in rows:
+            src = str(r.get("source") or "unknown")
+            flows_by_source[src] = flows_by_source.get(src, 0) + 1
+
+    total_alerts = 0
+    alerts_by_level: Dict[str, int] = {}
+    alerts_by_class: Dict[str, int] = {}
+    if alerts_table is not None:
+        arows = db.execute(alerts_table.select()).mappings().all()
+        total_alerts = len(arows)
+        for r in arows:
+            lvl = str(r.get("level") or "unknown")
+            cls = str(r.get("attack_class") or "unknown")
+            alerts_by_level[lvl] = alerts_by_level.get(lvl, 0) + 1
+            alerts_by_class[cls] = alerts_by_class.get(cls, 0) + 1
+
+    return {
+        "total_flows": total_flows,
+        "flows_by_source": flows_by_source,
+        "total_alerts": total_alerts,
+        "alerts_by_level": alerts_by_level,
+        "alerts_by_class": alerts_by_class,
+    }
+
+
+@app.get("/flows")
+def list_flows(
+    limit: int = Query(default=20, ge=1, le=200),
+    source: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    flows_table = Base.metadata.tables.get("flows")
+    if flows_table is None:
+        return {"count": 0, "flows": []}
+
+    stmt = flows_table.select()
+    if source:
+        stmt = stmt.where(flows_table.c.source == source)
+    if "id" in flows_table.c:
+        stmt = stmt.order_by(flows_table.c.id.desc())
+    stmt = stmt.limit(limit)
+
+    rows = [dict(r) for r in db.execute(stmt).mappings().all()]
+    for r in rows:
+        r.pop("feature_vector", None)
+    return {"count": len(rows), "flows": rows}
+
+
+@app.get("/alerts/{alert_id}")
+def get_alert_detail(alert_id: int, db: Session = Depends(get_db)):
+    alerts_table = Base.metadata.tables.get("alerts")
+    evidence_table = Base.metadata.tables.get("alert_evidence")
+    flows_table = Base.metadata.tables.get("flows")
+
+    if alerts_table is None:
+        raise HTTPException(status_code=404, detail="Alerts table not available.")
+
+    arow = db.execute(
+        alerts_table.select().where(alerts_table.c.id == alert_id)
+    ).mappings().first()
+    if not arow:
+        raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found.")
+
+    alert_obj = dict(arow)
+    if flows_table is not None and alert_obj.get("flow_id") is not None:
+        frow = db.execute(
+            flows_table.select().where(flows_table.c.id == alert_obj["flow_id"])
+        ).mappings().first()
+        if frow:
+            fdict = dict(frow)
+            fdict.pop("feature_vector", None)
+            alert_obj["flow"] = fdict
+
+    evidence_list = []
+    if evidence_table is not None:
+        erows = db.execute(
+            evidence_table.select().where(evidence_table.c.alert_id == alert_id)
+        ).mappings().all()
+        evidence_list = [dict(e) for e in erows]
+
+    alert_obj["evidence"] = evidence_list
+    return alert_obj
+
+
+@app.patch("/alerts/{alert_id}/status")
+def update_alert_status(
+    alert_id: int,
+    status: str = Query(..., pattern="^(open|acknowledged|resolved|false_positive)$"),
+    db: Session = Depends(get_db),
+):
+    alerts_table = Base.metadata.tables.get("alerts")
+    if alerts_table is None:
+        raise HTTPException(status_code=404, detail="Alerts table not available.")
+
+    existing = db.execute(
+        alerts_table.select().where(alerts_table.c.id == alert_id)
+    ).mappings().first()
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found.")
+
+    db.execute(
+        alerts_table.update()
+        .where(alerts_table.c.id == alert_id)
+        .values(status=status)
+    )
+    db.commit()
+    return {"id": alert_id, "status": status}
+
+
+
+@app.get("/models/drift")
+def get_model_feature_drift(
+    db: Session = Depends(get_db),
+):
+    """Calculate PSI from recent persisted live flows against the V3 train baseline."""
+    global _DRIFT_REFERENCE, _DRIFT_HISTORY, _DRIFT_LAST_FLOW_ID
+
+    reference_path = (
+        Path(os.getenv("NIDS_ARTIFACTS_DIR", "artifacts/models/v3"))
+        / "feature_drift_reference.json"
+    )
+
+    if _DRIFT_REFERENCE is None:
+        if not reference_path.exists():
+            return {
+                "status": "baseline_missing",
+                "message": "V3 feature drift reference is unavailable.",
+                "sample_count": 0,
+                "minimum_samples": 100,
+                "window_size": 500,
+                "history": _DRIFT_HISTORY,
+            }
+        with reference_path.open("r") as handle:
+            _DRIFT_REFERENCE = json.load(handle)
+
+    reference = _DRIFT_REFERENCE
+    feature_refs = reference.get("features", {})
+    informative = {
+        name: item
+        for name, item in feature_refs.items()
+        if item.get("informative") and item.get("edges") and item.get("expected")
+    }
+
+    flows_table = Base.metadata.tables.get("flows")
+    if flows_table is None:
+        raise HTTPException(status_code=503, detail="Flows table is unavailable.")
+
+    rows = db.execute(
+        flows_table.select()
+        .where(flows_table.c.source == "live")
+        .order_by(flows_table.c.id.desc())
+        .limit(500)
+    ).mappings().all()
+
+    newest_flow_id = int(rows[0]["id"]) if rows else None
+    sample_count = len(rows)
+
+    base_response = {
+        "reference_source": reference.get("reference_source"),
+        "feature_count": reference.get("feature_count", 52),
+        "informative_feature_count": len(informative),
+        "sample_count": sample_count,
+        "minimum_samples": 100,
+        "window_size": 500,
+        "history": _DRIFT_HISTORY[-60:],
+    }
+
+    if sample_count < 100:
+        return {
+            **base_response,
+            "status": "insufficient_data",
+            "message": "At least 100 persisted live flows are required.",
+            "overall_psi": None,
+            "highest_drift_feature": None,
+            "feature_psi": {},
+        }
+
+    # Oldest-to-newest ordering is useful for consistent rolling analysis.
+    rows = list(reversed(rows))
+    feature_values = {name: [] for name in informative}
+
+    for row in rows:
+        raw = row.get("feature_vector")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+
+        if not isinstance(raw, dict):
+            continue
+
+        for name in informative:
+            value = raw.get(name)
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(value):
+                feature_values[name].append(value)
+
+    feature_psi = {}
+    feature_counts = {}
+
+    for name, ref in informative.items():
+        values = feature_values[name]
+        feature_counts[name] = len(values)
+
+        if len(values) < 100:
+            continue
+
+        edges = np.asarray(ref["edges"], dtype=np.float64)
+        expected = np.asarray(ref["expected"], dtype=np.float64)
+
+        if len(edges) != len(expected) + 1:
+            continue
+
+        current = np.asarray(values, dtype=np.float64)
+        # Clamp out-of-reference-range values into the edge bins.
+        current = np.clip(current, edges[0], edges[-1])
+        observed_counts, _ = np.histogram(current, bins=edges)
+
+        observed = observed_counts.astype(np.float64)
+        observed = observed / max(observed.sum(), 1.0)
+
+        # Small epsilon prevents undefined logarithms for empty bins.
+        epsilon = 1e-6
+        expected = np.clip(expected, epsilon, None)
+        observed = np.clip(observed, epsilon, None)
+        expected = expected / expected.sum()
+        observed = observed / observed.sum()
+
+        psi = float(np.sum((observed - expected) * np.log(observed / expected)))
+        feature_psi[name] = psi
+
+    # Do not publish an aggregate unless all informative features have
+    # enough valid values in the current rolling window.
+    if len(feature_psi) != len(informative):
+        return {
+            **base_response,
+            "status": "insufficient_data",
+            "message": "Not enough valid live values across all informative features.",
+            "overall_psi": None,
+            "highest_drift_feature": None,
+            "feature_psi": feature_psi,
+            "feature_sample_counts": feature_counts,
+        }
+
+    overall_psi = float(np.mean(list(feature_psi.values())))
+    highest_name = max(feature_psi, key=feature_psi.get)
+    highest_value = float(feature_psi[highest_name])
+
+    if overall_psi >= 0.20:
+        status = "significant_drift"
+    elif overall_psi >= 0.10:
+        status = "moderate_drift"
+    else:
+        status = "stable"
+
+    # Only append a trend point when a new live flow has arrived.
+    if newest_flow_id is not None and newest_flow_id != _DRIFT_LAST_FLOW_ID:
+        _DRIFT_HISTORY.append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "overall_psi": overall_psi,
+            "sample_count": sample_count,
+            "latest_flow_id": newest_flow_id,
+        })
+        _DRIFT_HISTORY = _DRIFT_HISTORY[-60:]
+        _DRIFT_LAST_FLOW_ID = newest_flow_id
+
+    return {
+        **base_response,
+        "status": status,
+        "overall_psi": overall_psi,
+        "highest_drift_feature": {
+            "name": highest_name,
+            "psi": highest_value,
+        },
+        "feature_psi": feature_psi,
+        "feature_sample_counts": feature_counts,
+        "history": _DRIFT_HISTORY[-60:],
+        "thresholds": {
+            "stable_below": 0.10,
+            "moderate_below": 0.20,
+            "significant_at_or_above": 0.20,
+        },
+    }
+
+
+@app.get("/models/info")
+def get_models_info():
+    detector = get_detector()
+    schema_path = Path(__file__).resolve().parents[2] / "src" / "features" / "features_v1.json"
+    schema_features = []
+    if schema_path.exists():
+        raw = json.loads(schema_path.read_text())
+        schema_features = raw.get("features", raw) if isinstance(raw, dict) else raw
+
+    return {
+        "active_version": detector.model_version,
+        "schema_name": "features_v1.json",
+        "feature_count": len(schema_features),
+        "features": schema_features,
+        "detectors": [
+            {"name": "XGBoost Binary (Calibrated)", "role": "Supervised binary threat probability"},
+            {"name": "Random Forest Binary (Calibrated)", "role": "Ensemble variance & boundary check"},
+            {"name": "Isolation Forest", "role": "Zero-day / out-of-distribution anomaly scoring"},
+            {"name": "Multiclass Attack Classifier", "role": "Attack family attribution"},
+        ],
+    }
+
+
+@app.get("/traffic/summary")
+def get_traffic_summary(limit_flows: int = Query(default=500, ge=10, le=5000), db: Session = Depends(get_db)):
+    flows_table = Base.metadata.tables.get("flows")
+    if flows_table is None:
+        return {"total_sampled": 0, "protocols": {}, "top_talkers": [], "top_ports": []}
+
+    stmt = flows_table.select()
+    if "id" in flows_table.c:
+        stmt = stmt.order_by(flows_table.c.id.desc())
+    rows = [dict(r) for r in db.execute(stmt.limit(limit_flows)).mappings().all()]
+
+    proto_counts: Dict[str, int] = {}
+    host_stats: Dict[str, Dict[str, Any]] = {}
+    port_counts: Dict[int, int] = {}
+
+    for r in rows:
+        proto = str(r.get("proto") or "Other").upper()
+        if proto not in ("TCP", "UDP", "ICMP"):
+            proto = "Other"
+        proto_counts[proto] = proto_counts.get(proto, 0) + 1
+
+        src_ip = str(r.get("src_ip") or "0.0.0.0")
+        fv = r.get("feature_vector") or {}
+        if isinstance(fv, str):
+            try:
+                fv = json.loads(fv)
+            except Exception:
+                fv = {}
+        byte_total = float(fv.get("total_length_fwd_packets", 0.0)) + float(fv.get("total_length_bwd_packets", 0.0))
+
+        if src_ip not in host_stats:
+            host_stats[src_ip] = {"host": src_ip, "flows": 0, "bytes": 0.0}
+        host_stats[src_ip]["flows"] += 1
+        host_stats[src_ip]["bytes"] += byte_total
+
+        dst_port = int(r.get("dst_port") or 0)
+        if dst_port > 0:
+            port_counts[dst_port] = port_counts.get(dst_port, 0) + 1
+
+    top_talkers = sorted(host_stats.values(), key=lambda x: x["flows"], reverse=True)[:5]
+    for t in top_talkers:
+        t["mb"] = round(t["bytes"] / (1024 * 1024), 2)
+
+    top_ports = [
+        {"port": port, "count": cnt}
+        for port, cnt in sorted(port_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+    ]
+
+    return {
+        "total_sampled": len(rows),
+        "protocols": proto_counts,
+        "top_talkers": top_talkers,
+        "top_ports": top_ports,
+    }
+
+
+
+@app.get("/traffic/timeseries")
+def get_traffic_timeseries(
+    window: str = Query(default="15m"),
+    db: Session = Depends(get_db),
+):
+    from sqlalchemy import text
+
+    windows = {
+        "1m": (60, 5),
+        "15m": (900, 30),
+        "1h": (3600, 120),
+        "24h": (86400, 900),
+    }
+
+    if window not in windows:
+        raise HTTPException(
+            status_code=400,
+            detail="window must be one of: 1m, 15m, 1h, 24h",
+        )
+
+    window_seconds, bucket_seconds = windows[window]
+
+    query = text("""
+        WITH params AS (
+            SELECT
+                now() AS end_at,
+                now() - make_interval(secs => :window_seconds) AS start_at,
+                CAST(:bucket_seconds AS integer) AS bucket_seconds
+        ),
+        buckets AS (
+            SELECT generate_series(
+                to_timestamp(
+                    floor(extract(epoch FROM p.start_at) / p.bucket_seconds)
+                    * p.bucket_seconds
+                ),
+                to_timestamp(
+                    floor(extract(epoch FROM p.end_at) / p.bucket_seconds)
+                    * p.bucket_seconds
+                ),
+                make_interval(secs => p.bucket_seconds)
+            ) AS bucket
+            FROM params p
+        ),
+        aggregated AS (
+            SELECT
+                to_timestamp(
+                    floor(extract(epoch FROM f.ts) / p.bucket_seconds)
+                    * p.bucket_seconds
+                ) AS bucket,
+                SUM(COALESCE(
+                    NULLIF(f.feature_vector->>'total_length_fwd_packets', '')::double precision,
+                    0
+                )) AS forward_bytes,
+                SUM(COALESCE(
+                    NULLIF(f.feature_vector->>'total_length_bwd_packets', '')::double precision,
+                    0
+                )) AS reverse_bytes,
+                SUM(
+                    COALESCE(NULLIF(f.feature_vector->>'total_fwd_packets', '')::double precision, 0)
+                    + COALESCE(NULLIF(f.feature_vector->>'total_bwd_packets', '')::double precision, 0)
+                ) AS total_packets,
+                COUNT(*) AS flow_count,
+                COUNT(*) FILTER (
+                    WHERE a.id IS NULL OR a.level = 'benign'
+                ) AS benign,
+                COUNT(*) FILTER (
+                    WHERE a.level = 'suspicious'
+                ) AS suspicious,
+                COUNT(*) FILTER (
+                    WHERE a.level = 'confirmed_malicious'
+                ) AS malicious
+            FROM flows f
+            CROSS JOIN params p
+            LEFT JOIN alerts a ON a.flow_id = f.id
+            WHERE f.source = 'live'
+              AND f.ts >= p.start_at
+              AND f.ts <= p.end_at
+            GROUP BY 1
+        )
+        SELECT
+            b.bucket,
+            COALESCE(a.forward_bytes, 0) AS forward_bytes,
+            COALESCE(a.reverse_bytes, 0) AS reverse_bytes,
+            COALESCE(a.total_packets, 0) AS total_packets,
+            COALESCE(a.flow_count, 0) AS flow_count,
+            COALESCE(a.benign, 0) AS benign,
+            COALESCE(a.suspicious, 0) AS suspicious,
+            COALESCE(a.malicious, 0) AS malicious
+        FROM buckets b
+        LEFT JOIN aggregated a ON a.bucket = b.bucket
+        ORDER BY b.bucket
+    """)
+
+    rows = db.execute(query, {
+        "window_seconds": window_seconds,
+        "bucket_seconds": bucket_seconds,
+    }).mappings().all()
+
+    return {
+        "window": window,
+        "bucket_seconds": bucket_seconds,
+        "source": "live",
+        "points": [
+            {
+                "timestamp": row["bucket"].isoformat(),
+                "forward_bytes_per_sec": round(float(row["forward_bytes"]) / bucket_seconds, 2),
+                "reverse_bytes_per_sec": round(float(row["reverse_bytes"]) / bucket_seconds, 2),
+                "packets_per_sec": round(float(row["total_packets"]) / bucket_seconds, 2),
+                "flow_count": int(row["flow_count"]),
+                "benign": int(row["benign"]),
+                "suspicious": int(row["suspicious"]),
+                "malicious": int(row["malicious"]),
+            }
+            for row in rows
+        ],
+    }
+
+
+@app.get("/")
+def serve_dashboard():
+    index_file = Path("src/api/static/index.html")
+    if not index_file.exists():
+        raise HTTPException(status_code=404, detail="Dashboard UI not built yet.")
+    return FileResponse(index_file)
+
+
+@app.get("/capture/status")
+def get_capture_status(db: Session = Depends(get_db)):
+    telemetry_path = Path(os.getenv(
+        "NIDS_TELEMETRY_FILE",
+        "/run/nids-capture/telemetry.json",
+    ))
+    telemetry = {}
+    if telemetry_path.exists():
+        try:
+            telemetry = json.loads(telemetry_path.read_text())
+        except (OSError, ValueError):
+            telemetry = {}
+    flows_table = Base.metadata.tables.get("flows")
+    last_live_at = None
+    live_count = 0
+    if flows_table is not None:
+        rows = db.execute(
+            flows_table.select().where(flows_table.c.source == "live").order_by(flows_table.c.id.desc())
+        ).mappings().all()
+        live_count = len(rows)
+        if rows:
+            ts = rows[0].get("created_at") or rows[0].get("timestamp")
+            last_live_at = ts.isoformat() if hasattr(ts, "isoformat") else (str(ts) if ts else None)
+
+    telemetry_age = (
+        max(0, datetime.now(timezone.utc).timestamp() - float(telemetry.get("updated_at", 0)))
+        if telemetry.get("updated_at") else None
+    )
+    telemetry_fresh = telemetry_age is not None and telemetry_age <= 5
+
+    return {
+        **telemetry,
+        "interface": telemetry.get("interface") or os.getenv("NIDS_CAPTURE_IFACE", "wlo1"),
+        "bpf_filter": telemetry.get("bpf_filter") or os.getenv("NIDS_BPF_FILTER", "ip and (tcp or udp or icmp)"),
+        "worker_active": bool(telemetry_fresh and telemetry.get("status") == "running"),
+        "telemetry_fresh": telemetry_fresh,
+        "telemetry_age_seconds": round(telemetry_age, 2) if telemetry_age is not None else None,
+        "live_flows_total": live_count,
+        "last_live_ingest": last_live_at,
+    }

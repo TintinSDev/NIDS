@@ -1,0 +1,163 @@
+{
+  "artifact_version": "v2",
+  "feature_count": 52,
+  "training": {
+    "rows": 172508,
+    "class_counts": {
+      "1": 102396,
+      "0": 70112
+    },
+    "multiclass_classes": [
+      "Benign",
+      "DoS/DDoS"
+    ]
+  },
+  "calibration": {
+    "rows": 43128
+  },
+  "validation": {
+    "rows": 104060,
+    "xgb_binary": {
+      "threshold": 0.0026938808150589466,
+      "precision": 0.3020041465100207,
+      "recall": 0.22724908996359855,
+      "f1": 0.2593471810089021,
+      "pr_auc": 0.1153995721680092,
+      "fpr": 0.009888678931239413,
+      "confusion_matrix": {
+        "true_negative": 101127,
+        "false_positive": 1010,
+        "false_negative": 1486,
+        "true_positive": 437
+      }
+    },
+    "rf_pr_auc": 0.45166804544047745,
+    "isolation_forest_pr_auc": 0.02715388081879118,
+    "multiclass": {
+      "evaluated_rows": 102137,
+      "excluded_unseen_family_rows": 1923,
+      "classes": [
+        "Benign",
+        "DoS/DDoS"
+      ],
+      "report": {
+        "Benign": {
+          "precision": 1.0,
+          "recall": 0.9993342275571047,
+          "f1-score": 0.9996670029284154,
+          "support": 102137.0
+        },
+        "DoS/DDoS": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1-score": 0.0,
+          "support": 0.0
+        },
+        "accuracy": 0.9993342275571047,
+        "macro avg": {
+          "precision": 0.5,
+          "recall": 0.49966711377855233,
+          "f1-score": 0.4998335014642077,
+          "support": 102137.0
+        },
+        "weighted avg": {
+          "precision": 1.0,
+          "recall": 0.9993342275571047,
+          "f1-score": 0.9996670029284154,
+          "support": 102137.0
+        }
+      }
+    }
+  },
+  "test": {
+    "rows": 344159,
+    "xgb_binary": {
+      "threshold": 0.0026938808150589466,
+      "precision": 0.632229232386961,
+      "recall": 0.2648678414096916,
+      "f1": 0.37333126358273827,
+      "pr_auc": 0.21558382903986312,
+      "fpr": 0.004175134818953143,
+      "confusion_matrix": {
+        "true_negative": 333680,
+        "false_positive": 1399,
+        "false_negative": 6675,
+        "true_positive": 2405
+      }
+    },
+    "rf_binary": {
+      "threshold": 0.0026938808150589466,
+      "precision": 0.1524020694752402,
+      "recall": 0.45418502202643174,
+      "f1": 0.2282235749861649,
+      "pr_auc": 0.13976156251191735,
+      "fpr": 0.06844952981237261,
+      "confusion_matrix": {
+        "true_negative": 312143,
+        "false_positive": 22936,
+        "false_negative": 4956,
+        "true_positive": 4124
+      }
+    },
+    "isolation_forest_pr_auc": 0.05089141749733019,
+    "per_attack_family": {
+      "Benign": {
+        "rows": 335079,
+        "malicious_rows": 0,
+        "detected_malicious": 0,
+        "missed_malicious": 0,
+        "false_positives": 1399,
+        "malicious_recall": null
+      },
+      "Brute Force": {
+        "rows": 9080,
+        "malicious_rows": 9080,
+        "detected_malicious": 2405,
+        "missed_malicious": 6675,
+        "false_positives": 0,
+        "malicious_recall": 0.2648678414096916
+      }
+    },
+    "multiclass": {
+      "evaluated_rows": 335079,
+      "excluded_unseen_family_rows": 9080,
+      "classes": [
+        "Benign",
+        "DoS/DDoS"
+      ],
+      "report": {
+        "Benign": {
+          "precision": 1.0,
+          "recall": 0.9999701562915014,
+          "f1-score": 0.9999850779230857,
+          "support": 335079.0
+        },
+        "DoS/DDoS": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1-score": 0.0,
+          "support": 0.0
+        },
+        "accuracy": 0.9999701562915014,
+        "macro avg": {
+          "precision": 0.5,
+          "recall": 0.4999850781457507,
+          "f1-score": 0.49999253896154283,
+          "support": 335079.0
+        },
+        "weighted avg": {
+          "precision": 1.0,
+          "recall": 0.9999701562915014,
+          "f1-score": 0.9999850779230856,
+          "support": 335079.0
+        }
+      }
+    }
+  },
+  "limitations": [
+    "Training contains only the attack families present in the DDoS capture.",
+    "PortScan and Brute Force are unseen attack families for the multiclass model.",
+    "The final test set is from a separate capture, but source IPs, ports and timestamps are unavailable for session-level split verification.",
+    "Threshold selection is based on the PortScan validation capture and may not generalize to other traffic distributions."
+  ]
+}

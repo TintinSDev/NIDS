@@ -1,0 +1,233 @@
+{
+  "comparison": "v1_vs_v2",
+  "threshold_selection": "Maximum validation recall subject to FPR <= 1%",
+  "max_validation_fpr": 0.01,
+  "validation_rows": 104060,
+  "test_rows": 344159,
+  "models": {
+    "v1": {
+      "xgb": {
+        "threshold_selection": {
+          "threshold": 0.10604333132505417,
+          "validation_fpr": 0.008694204842515445,
+          "validation_recall": 0.11700468018720749
+        },
+        "validation": {
+          "rows": 104060,
+          "threshold": 0.10604333132505417,
+          "precision": 0.20215633423180593,
+          "recall": 0.11700468018720749,
+          "f1": 0.1482213438735178,
+          "pr_auc": 0.08756244618862744,
+          "fpr": 0.008694204842515445,
+          "confusion_matrix": {
+            "true_negative": 101249,
+            "false_positive": 888,
+            "false_negative": 1698,
+            "true_positive": 225
+          }
+        },
+        "test": {
+          "rows": 344159,
+          "threshold": 0.10604333132505417,
+          "precision": 0.6147473073736537,
+          "recall": 0.16343612334801763,
+          "f1": 0.2582216808769793,
+          "pr_auc": 0.18776663738592908,
+          "fpr": 0.002775464890369137,
+          "confusion_matrix": {
+            "true_negative": 334149,
+            "false_positive": 930,
+            "false_negative": 7596,
+            "true_positive": 1484
+          },
+          "per_attack_family": {
+            "Benign": {
+              "rows": 335079,
+              "actual_attacks": 0,
+              "detected_attacks": 0,
+              "missed_attacks": 0,
+              "false_positives": 930,
+              "attack_recall": null
+            },
+            "Brute Force": {
+              "rows": 9080,
+              "actual_attacks": 9080,
+              "detected_attacks": 1484,
+              "missed_attacks": 7596,
+              "false_positives": 0,
+              "attack_recall": 0.16343612334801763
+            }
+          }
+        }
+      },
+      "rf": {
+        "threshold_selection": {
+          "threshold": 0.2306766509543066,
+          "validation_fpr": 0.009996377414648951,
+          "validation_recall": 0.4456578263130525
+        },
+        "validation": {
+          "rows": 104060,
+          "threshold": 0.2306766509543066,
+          "precision": 0.45633652822151227,
+          "recall": 0.4456578263130525,
+          "f1": 0.45093396474611946,
+          "pr_auc": 0.2915327391108561,
+          "fpr": 0.009996377414648951,
+          "confusion_matrix": {
+            "true_negative": 101116,
+            "false_positive": 1021,
+            "false_negative": 1066,
+            "true_positive": 857
+          }
+        },
+        "test": {
+          "rows": 344159,
+          "threshold": 0.2306766509543066,
+          "precision": 0.2722429408630794,
+          "recall": 0.2813876651982379,
+          "f1": 0.27673977795829946,
+          "pr_auc": 0.11015553073127182,
+          "fpr": 0.02038325290453893,
+          "confusion_matrix": {
+            "true_negative": 328249,
+            "false_positive": 6830,
+            "false_negative": 6525,
+            "true_positive": 2555
+          },
+          "per_attack_family": {
+            "Benign": {
+              "rows": 335079,
+              "actual_attacks": 0,
+              "detected_attacks": 0,
+              "missed_attacks": 0,
+              "false_positives": 6830,
+              "attack_recall": null
+            },
+            "Brute Force": {
+              "rows": 9080,
+              "actual_attacks": 9080,
+              "detected_attacks": 2555,
+              "missed_attacks": 6525,
+              "false_positives": 0,
+              "attack_recall": 0.2813876651982379
+            }
+          }
+        }
+      }
+    },
+    "v2": {
+      "xgb": {
+        "threshold_selection": {
+          "threshold": 0.0026938808150589466,
+          "validation_fpr": 0.009888678931239413,
+          "validation_recall": 0.22724908996359855
+        },
+        "validation": {
+          "rows": 104060,
+          "threshold": 0.0026938808150589466,
+          "precision": 0.3020041465100207,
+          "recall": 0.22724908996359855,
+          "f1": 0.2593471810089021,
+          "pr_auc": 0.1153995721680092,
+          "fpr": 0.009888678931239413,
+          "confusion_matrix": {
+            "true_negative": 101127,
+            "false_positive": 1010,
+            "false_negative": 1486,
+            "true_positive": 437
+          }
+        },
+        "test": {
+          "rows": 344159,
+          "threshold": 0.0026938808150589466,
+          "precision": 0.632229232386961,
+          "recall": 0.2648678414096916,
+          "f1": 0.37333126358273827,
+          "pr_auc": 0.21558382903986312,
+          "fpr": 0.004175134818953143,
+          "confusion_matrix": {
+            "true_negative": 333680,
+            "false_positive": 1399,
+            "false_negative": 6675,
+            "true_positive": 2405
+          },
+          "per_attack_family": {
+            "Benign": {
+              "rows": 335079,
+              "actual_attacks": 0,
+              "detected_attacks": 0,
+              "missed_attacks": 0,
+              "false_positives": 1399,
+              "attack_recall": null
+            },
+            "Brute Force": {
+              "rows": 9080,
+              "actual_attacks": 9080,
+              "detected_attacks": 2405,
+              "missed_attacks": 6675,
+              "false_positives": 0,
+              "attack_recall": 0.2648678414096916
+            }
+          }
+        }
+      },
+      "rf": {
+        "threshold_selection": {
+          "threshold": 0.014717206816634151,
+          "validation_fpr": 0.009262069573220283,
+          "validation_recall": 0.4664586583463339
+        },
+        "validation": {
+          "rows": 104060,
+          "threshold": 0.014717206816634151,
+          "precision": 0.48670645686380903,
+          "recall": 0.4664586583463339,
+          "f1": 0.4763674986723314,
+          "pr_auc": 0.45166804544047745,
+          "fpr": 0.009262069573220283,
+          "confusion_matrix": {
+            "true_negative": 101191,
+            "false_positive": 946,
+            "false_negative": 1026,
+            "true_positive": 897
+          }
+        },
+        "test": {
+          "rows": 344159,
+          "threshold": 0.014717206816634151,
+          "precision": 0.3375555855006064,
+          "recall": 0.2758810572687225,
+          "f1": 0.3036179625477244,
+          "pr_auc": 0.13976156251191735,
+          "fpr": 0.014671167097908255,
+          "confusion_matrix": {
+            "true_negative": 330163,
+            "false_positive": 4916,
+            "false_negative": 6575,
+            "true_positive": 2505
+          },
+          "per_attack_family": {
+            "Benign": {
+              "rows": 335079,
+              "actual_attacks": 0,
+              "detected_attacks": 0,
+              "missed_attacks": 0,
+              "false_positives": 4916,
+              "attack_recall": null
+            },
+            "Brute Force": {
+              "rows": 9080,
+              "actual_attacks": 9080,
+              "detected_attacks": 2505,
+              "missed_attacks": 6575,
+              "false_positives": 0,
+              "attack_recall": 0.2758810572687225
+            }
+          }
+        }
+      }
+    }
+  }
+}
