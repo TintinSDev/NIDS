@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 
+
 class FlowItem(BaseModel):
     src_ip: str = "0.0.0.0"
     dst_ip: str = "0.0.0.0"
@@ -26,12 +27,13 @@ class FlowBatchRequest(BaseModel):
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import numpy as np
-from sqlalchemy import desc, select
+from sqlalchemy import desc, select, func
 from sqlalchemy.orm import Session
 
 from src.db.database import Base, SessionLocal, engine
 import src.db.models  # noqa: F401
 from src.decision.engine import NIDSDetectionEngine
+from collections import deque
 
 app = FastAPI(title="NIDS Inference & Alerting API", version="0.1.0")
 
@@ -44,6 +46,9 @@ app.add_middleware(
 )
 
 _engine_instance: Optional[NIDSDetectionEngine] = None
+
+_latest_capture_telemetry: Dict[str, Any] = {}
+_latest_capture_telemetry_received_at: Optional[datetime] = None
 
 _DRIFT_REFERENCE = None
 _DRIFT_HISTORY = []
@@ -313,6 +318,9 @@ async def analyze_upload(
 
 
 
+flow_alert_latency_samples = deque(maxlen=60)
+
+
 @app.post("/analyze/flows")
 def analyze_flows(
     payload: FlowBatchRequest,
@@ -340,6 +348,28 @@ def analyze_flows(
     if persist:
         persisted_stats = _persist_decisions(db, df, decisions, source_name=payload.source or "live")
 
+        # Operational latency: capture batch dispatch -> alert persistence.
+        if (
+            (payload.source or "live") == "live"
+            and persisted_stats.get("alerts_created", 0) > 0
+            and payload.captured_at
+        ):
+            try:
+                captured_at = datetime.fromisoformat(
+                    payload.captured_at.replace("Z", "+00:00")
+                )
+                if captured_at.tzinfo is None:
+                    captured_at = captured_at.replace(tzinfo=timezone.utc)
+                elapsed_ms = (
+                    datetime.now(timezone.utc) - captured_at
+                ).total_seconds() * 1000.0
+                if elapsed_ms >= 0:
+                    flow_alert_latency_samples.append(round(elapsed_ms, 2))
+            except (TypeError, ValueError, OverflowError):
+                # Ignore malformed timestamps; do not fail flow analysis.
+                pass
+
+
     tier_counts = {"benign": 0, "suspicious": 0, "confirmed_malicious": 0}
     for d in decisions:
         tier_counts[d["level"]] = tier_counts.get(d["level"], 0) + 1
@@ -353,33 +383,77 @@ def analyze_flows(
     }
 
 
+
 @app.get("/alerts")
 def list_alerts(
-    level: Optional[str] = Query(default=None, description="Filter by benign, suspicious, or confirmed_malicious"),
+    level: Optional[str] = Query(default=None),
     attack_class: Optional[str] = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=500),
+    status: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=1, le=250),
     db: Session = Depends(get_db),
 ):
     alerts_table = Base.metadata.tables.get("alerts")
+
     if alerts_table is None:
-        return {"count": 0, "alerts": []}
+        return {
+            "count": 0,
+            "total": 0,
+            "page": page,
+            "page_size": page_size,
+            "pages": 0,
+            "alerts": [],
+        }
 
     stmt = select(alerts_table)
+
     if level and "level" in alerts_table.c:
         stmt = stmt.where(alerts_table.c.level == level)
-    elif level and "severity" in alerts_table.c:
-        stmt = stmt.where(alerts_table.c.severity == level)
 
     if attack_class and "attack_class" in alerts_table.c:
         stmt = stmt.where(alerts_table.c.attack_class == attack_class)
 
-    order_col = alerts_table.c.id if "id" in alerts_table.c else list(alerts_table.columns)[0]
-    stmt = stmt.order_by(desc(order_col)).limit(limit)
+    if status and "status" in alerts_table.c:
+        stmt = stmt.where(alerts_table.c.status == status)
 
-    rows = db.execute(stmt).mappings().all()
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        conditions = []
+
+        if "attack_class" in alerts_table.c:
+            conditions.append(alerts_table.c.attack_class.ilike(term))
+
+        if "id" in alerts_table.c and search.strip().isdigit():
+            conditions.append(alerts_table.c.id == int(search.strip()))
+
+        if conditions:
+            from sqlalchemy import or_
+            stmt = stmt.where(or_(*conditions))
+
+    # Count matching records without retrieving them.
+    total = db.execute(
+        select(func.count()).select_from(stmt.subquery())
+    ).scalar_one()
+
+    order_col = (
+        alerts_table.c.id
+        if "id" in alerts_table.c
+        else list(alerts_table.columns)[0]
+    )
+
+    # Retrieve only the requested page.
+    rows = db.execute(
+        stmt.order_by(desc(order_col))
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    ).mappings().all()
+
     serialized = []
+
     for r in rows:
         item = {}
+
         for k, v in r.items():
             if isinstance(v, datetime):
                 item[k] = v.isoformat()
@@ -390,9 +464,19 @@ def list_alerts(
                     item[k] = v
             else:
                 item[k] = v
+
         serialized.append(item)
 
-    return {"count": len(serialized), "alerts": serialized}
+    return {
+        "count": len(serialized),
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": (total + page_size - 1) // page_size,
+        "alerts": serialized,
+    }
+
+
 
 
 @app.get("/stats")
@@ -402,24 +486,54 @@ def get_stats(db: Session = Depends(get_db)):
 
     total_flows = 0
     flows_by_source: Dict[str, int] = {}
+
     if flows_table is not None:
-        rows = db.execute(flows_table.select()).mappings().all()
-        total_flows = len(rows)
-        for r in rows:
-            src = str(r.get("source") or "unknown")
-            flows_by_source[src] = flows_by_source.get(src, 0) + 1
+        total_flows = db.execute(
+            select(func.count()).select_from(flows_table)
+        ).scalar_one()
+
+        if "source" in flows_table.c:
+            rows = db.execute(
+                select(
+                    flows_table.c.source,
+                    func.count().label("count"),
+                ).group_by(flows_table.c.source)
+            ).all()
+
+            flows_by_source = {
+                str(source or "unknown"): count
+                for source, count in rows
+            }
 
     total_alerts = 0
     alerts_by_level: Dict[str, int] = {}
     alerts_by_class: Dict[str, int] = {}
+    alerts_by_status: Dict[str, int] = {}
+
     if alerts_table is not None:
-        arows = db.execute(alerts_table.select()).mappings().all()
-        total_alerts = len(arows)
-        for r in arows:
-            lvl = str(r.get("level") or "unknown")
-            cls = str(r.get("attack_class") or "unknown")
-            alerts_by_level[lvl] = alerts_by_level.get(lvl, 0) + 1
-            alerts_by_class[cls] = alerts_by_class.get(cls, 0) + 1
+        total_alerts = db.execute(
+            select(func.count()).select_from(alerts_table)
+        ).scalar_one()
+
+        for column_name, destination in [
+            ("level", alerts_by_level),
+            ("attack_class", alerts_by_class),
+            ("status", alerts_by_status),
+        ]:
+            if column_name not in alerts_table.c:
+                continue
+
+            rows = db.execute(
+                select(
+                    alerts_table.c[column_name],
+                    func.count().label("count"),
+                ).group_by(alerts_table.c[column_name])
+            ).all()
+
+            destination.update({
+                str(value or "unknown"): count
+                for value, count in rows
+            })
 
     return {
         "total_flows": total_flows,
@@ -427,7 +541,9 @@ def get_stats(db: Session = Depends(get_db)):
         "total_alerts": total_alerts,
         "alerts_by_level": alerts_by_level,
         "alerts_by_class": alerts_by_class,
+        "alerts_by_status": alerts_by_status,
     }
+
 
 
 @app.get("/flows")
@@ -831,6 +947,11 @@ def get_traffic_timeseries(
                     NULLIF(f.feature_vector->>'total_length_bwd_packets', '')::double precision,
                     0
                 )) AS reverse_bytes,
+                SUM(
+                    COALESCE(NULLIF(f.feature_vector->>'total_fwd_packets', '')::double precision, 0)
+                    + COALESCE(NULLIF(f.feature_vector->>'total_bwd_packets', '')::double precision, 0)
+                ) AS total_packets,
+                COUNT(*) AS flow_count,
                 COUNT(*) FILTER (
                     WHERE a.id IS NULL OR a.level = 'benign'
                 ) AS benign,
@@ -852,6 +973,8 @@ def get_traffic_timeseries(
             b.bucket,
             COALESCE(a.forward_bytes, 0) AS forward_bytes,
             COALESCE(a.reverse_bytes, 0) AS reverse_bytes,
+            COALESCE(a.total_packets, 0) AS total_packets,
+            COALESCE(a.flow_count, 0) AS flow_count,
             COALESCE(a.benign, 0) AS benign,
             COALESCE(a.suspicious, 0) AS suspicious,
             COALESCE(a.malicious, 0) AS malicious
@@ -874,6 +997,8 @@ def get_traffic_timeseries(
                 "timestamp": row["bucket"].isoformat(),
                 "forward_bytes_per_sec": round(float(row["forward_bytes"]) / bucket_seconds, 2),
                 "reverse_bytes_per_sec": round(float(row["reverse_bytes"]) / bucket_seconds, 2),
+                "packets_per_sec": round(float(row["total_packets"]) / bucket_seconds, 2),
+                "flow_count": int(row["flow_count"]),
                 "benign": int(row["benign"]),
                 "suspicious": int(row["suspicious"]),
                 "malicious": int(row["malicious"]),
@@ -891,14 +1016,27 @@ def serve_dashboard():
     return FileResponse(index_file)
 
 
+@app.post("/capture/telemetry")
+def receive_capture_telemetry(payload: Dict[str, Any]):
+    """Receive the live capture worker heartbeat."""
+    global _latest_capture_telemetry, _latest_capture_telemetry_received_at
+
+    if payload.get("status") not in {"running", "stopping"}:
+        raise HTTPException(status_code=400, detail="Invalid capture status.")
+
+    _latest_capture_telemetry = dict(payload)
+    _latest_capture_telemetry_received_at = datetime.now(timezone.utc)
+    return {"received": True}
+
+
 @app.get("/capture/status")
 def get_capture_status(db: Session = Depends(get_db)):
     telemetry_path = Path(os.getenv(
         "NIDS_TELEMETRY_FILE",
         "/run/nids-capture/telemetry.json",
     ))
-    telemetry = {}
-    if telemetry_path.exists():
+    telemetry = dict(_latest_capture_telemetry)
+    if not telemetry and telemetry_path.exists():
         try:
             telemetry = json.loads(telemetry_path.read_text())
         except (OSError, ValueError):
@@ -912,13 +1050,20 @@ def get_capture_status(db: Session = Depends(get_db)):
         ).mappings().all()
         live_count = len(rows)
         if rows:
-            ts = rows[0].get("created_at") or rows[0].get("timestamp")
+            ts = rows[0].get("ts") or rows[0].get("created_at") or rows[0].get("timestamp")
             last_live_at = ts.isoformat() if hasattr(ts, "isoformat") else (str(ts) if ts else None)
 
-    telemetry_age = (
-        max(0, datetime.now(timezone.utc).timestamp() - float(telemetry.get("updated_at", 0)))
-        if telemetry.get("updated_at") else None
-    )
+    now_utc = datetime.now(timezone.utc)
+    if _latest_capture_telemetry_received_at is not None:
+        telemetry_age = max(
+            0.0,
+            (now_utc - _latest_capture_telemetry_received_at).total_seconds(),
+        )
+    else:
+        telemetry_age = (
+            max(0, now_utc.timestamp() - float(telemetry.get("updated_at", 0)))
+            if telemetry.get("updated_at") else None
+        )
     telemetry_fresh = telemetry_age is not None and telemetry_age <= 5
 
     return {
@@ -930,4 +1075,8 @@ def get_capture_status(db: Session = Depends(get_db)):
         "telemetry_age_seconds": round(telemetry_age, 2) if telemetry_age is not None else None,
         "live_flows_total": live_count,
         "last_live_ingest": last_live_at,
-    }
+    
+        "flow_alert_latency_avg_ms": (round(sum(flow_alert_latency_samples) / len(flow_alert_latency_samples), 2) if flow_alert_latency_samples else None),
+        "flow_alert_latency_samples": len(flow_alert_latency_samples),
+        "flow_alert_latency_recent_ms": list(flow_alert_latency_samples),
+}

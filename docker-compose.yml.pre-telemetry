@@ -1,0 +1,39 @@
+services:
+  db:
+    image: postgres:16
+    container_name: nids_postgres
+    environment:
+      POSTGRES_DB: nids_db
+      POSTGRES_USER: nids_admin
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nids_admin -d nids_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: nids_api
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://nids_admin:${POSTGRES_PASSWORD}@db:5432/nids_db
+      NIDS_ARTIFACTS_DIR: /app/artifacts/models/v3
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src:/app/src
+      - ./artifacts:/app/artifacts
+
+volumes:
+  postgres_data:
+    name: nids_postgres_data

@@ -389,6 +389,7 @@ def list_alerts(
     level: Optional[str] = Query(default=None),
     attack_class: Optional[str] = Query(default=None),
     status: Optional[str] = Query(default=None),
+    active_only: bool = Query(default=False),
     search: Optional[str] = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=250),
@@ -416,6 +417,11 @@ def list_alerts(
 
     if status and "status" in alerts_table.c:
         stmt = stmt.where(alerts_table.c.status == status)
+
+    if active_only and "status" in alerts_table.c:
+        stmt = stmt.where(
+            alerts_table.c.status.in_(["open", "acknowledged"])
+        )
 
     if search and search.strip():
         term = f"%{search.strip()}%"
@@ -509,6 +515,7 @@ def get_stats(db: Session = Depends(get_db)):
     alerts_by_level: Dict[str, int] = {}
     alerts_by_class: Dict[str, int] = {}
     alerts_by_status: Dict[str, int] = {}
+    active_alerts_by_level: Dict[str, int] = {}
 
     if alerts_table is not None:
         total_alerts = db.execute(
@@ -535,6 +542,23 @@ def get_stats(db: Session = Depends(get_db)):
                 for value, count in rows
             })
 
+        if "level" in alerts_table.c and "status" in alerts_table.c:
+            active_rows = db.execute(
+                select(
+                    alerts_table.c.level,
+                    func.count().label("count"),
+                )
+                .where(
+                    alerts_table.c.status.in_(["open", "acknowledged"])
+                )
+                .group_by(alerts_table.c.level)
+            ).all()
+
+            active_alerts_by_level = {
+                str(level or "unknown"): count
+                for level, count in active_rows
+            }
+
     return {
         "total_flows": total_flows,
         "flows_by_source": flows_by_source,
@@ -542,6 +566,7 @@ def get_stats(db: Session = Depends(get_db)):
         "alerts_by_level": alerts_by_level,
         "alerts_by_class": alerts_by_class,
         "alerts_by_status": alerts_by_status,
+        "active_alerts_by_level": active_alerts_by_level,
     }
 
 
@@ -629,6 +654,33 @@ def update_alert_status(
     db.commit()
     return {"id": alert_id, "status": status}
 
+
+@app.patch("/alerts/resolve-all")
+def resolve_all_alerts(db: Session = Depends(get_db)):
+    alerts_table = Base.metadata.tables.get("alerts")
+
+    if alerts_table is None:
+        raise HTTPException(status_code=404, detail="Alerts table not available.")
+
+    if "status" not in alerts_table.c:
+        raise HTTPException(
+            status_code=500,
+            detail="Alerts status column is not available.",
+        )
+
+    result = db.execute(
+        alerts_table.update()
+        .where(
+            alerts_table.c.status.in_(["open", "acknowledged"])
+        )
+        .values(status="resolved")
+    )
+    db.commit()
+
+    return {
+        "resolved_count": max(result.rowcount or 0, 0),
+        "status": "resolved",
+    }
 
 
 @app.get("/models/drift")

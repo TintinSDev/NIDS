@@ -124,6 +124,8 @@ Start the application containers:
 
 ```bash
 docker compose up -d
+docker compose up -d --build api
+
 ```
 
 Verify that the API is running:
